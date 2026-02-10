@@ -130,6 +130,9 @@ struct OffsiteCaptureDetailView: View {
     @State private var newTextPosition: CGPoint?
     @State private var pendingTextNormalizedPoint: NormalizedPoint?
     @State private var newTextContent: String = ""
+    @State private var selectedFrameId: UUID?  // Cuadro seleccionado para editar
+    @State private var showImagePicker = false  // Para cambiar imagen de cuadro
+    @State private var selectedImage: UIImage?  // Imagen seleccionada de galería
     
     enum EditTool {
         case none, measure, frame, text
@@ -218,6 +221,31 @@ struct OffsiteCaptureDetailView: View {
                 }
             }
         }
+            .overlay(alignment: .topLeading) {
+                // Información del LiDAR capturado
+                if !isEditMode, let metadata = data?.lidarMetadata {
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack(spacing: 6) {
+                            Image(systemName: metadata.isLiDARAvailable ? "sensor.fill" : "sensor")
+                                .font(.caption)
+                                .foregroundStyle(metadata.isLiDARAvailable ? .green : .secondary)
+                            Text(metadata.isLiDARAvailable ? "LiDAR" : "AR")
+                                .font(.caption2)
+                                .fontWeight(.medium)
+                        }
+                        if metadata.planeCount > 0 {
+                            Text("\(metadata.planeCount) planos detectados")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 8)
+                    .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12))
+                    .padding(.top, 60)
+                    .padding(.leading, 16)
+                }
+            }
             .overlay(alignment: .topTrailing) {
                 if isEditMode && editTool != .none {
                     editHint
@@ -241,6 +269,16 @@ struct OffsiteCaptureDetailView: View {
                 }
             } message: {
                 Text("Añade una anotación de texto en esta posición")
+            }
+            .sheet(isPresented: $showImagePicker) {
+                ImagePicker(selectedImage: $selectedImage)
+            }
+            .onChange(of: selectedImage) { _, newImage in
+                if let image = newImage, let frameId = selectedFrameId {
+                    updateFrameImage(id: frameId, image: image)
+                    selectedImage = nil
+                    showImagePicker = false
+                }
             }
             .onAppear {
                 image = UIImage(contentsOfFile: entry.imageURL.path)
@@ -498,13 +536,45 @@ struct OffsiteCaptureDetailView: View {
         let h = frame.height * imageSize.height * scale
         
         ZStack {
-            Rectangle()
-                .strokeBorder(Color(hex: frame.color), lineWidth: 3)
-                .background(Color(hex: frame.color).opacity(0.1))
-                .frame(width: w, height: h)
-                .position(x: x + w/2, y: y + h/2)
+            // Mostrar imagen del cuadro si existe, sino un rectángulo
+            if let base64 = frame.imageBase64,
+               let imageData = Data(base64Encoded: base64),
+               let frameImage = UIImage(data: imageData) {
+                Image(uiImage: frameImage)
+                    .resizable()
+                    .aspectRatio(contentMode: .fill)
+                    .frame(width: w, height: h)
+                    .clipShape(Rectangle())
+                    .overlay(
+                        Rectangle()
+                            .strokeBorder(Color(hex: frame.color), lineWidth: 3)
+                    )
+                    .position(x: x + w/2, y: y + h/2)
+            } else {
+                Rectangle()
+                    .strokeBorder(Color(hex: frame.color), lineWidth: 3)
+                    .background(Color(hex: frame.color).opacity(0.1))
+                    .frame(width: w, height: h)
+                    .position(x: x + w/2, y: y + h/2)
+            }
             
-            if let label = frame.label {
+            // Etiqueta con dimensiones reales si existen
+            if let widthM = frame.widthMeters, let heightM = frame.heightMeters {
+                VStack(spacing: 2) {
+                    if let label = frame.label {
+                        Text(label)
+                            .font(.caption)
+                            .fontWeight(.semibold)
+                    }
+                    Text(String(format: "%.2f × %.2f m", widthM, heightM))
+                        .font(.caption2)
+                }
+                .foregroundStyle(.white)
+                .padding(.horizontal, 6)
+                .padding(.vertical, 3)
+                .background(Color(hex: frame.color).opacity(0.9), in: RoundedRectangle(cornerRadius: 4))
+                .position(x: x + w/2, y: y - 12)
+            } else if let label = frame.label {
                 Text(label)
                     .font(.caption)
                     .fontWeight(.semibold)
@@ -518,6 +588,61 @@ struct OffsiteCaptureDetailView: View {
             if isEditMode {
                 Button {
                     deleteFrame(id: frame.id)
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundStyle(.red)
+                        .background(Circle().fill(.white))
+                }
+                .position(x: x + w - 8, y: y + 8)
+                
+                // Botones de edición de cuadro seleccionado
+                if selectedFrameId == frame.id {
+                    HStack(spacing: 8) {
+                        Button {
+                            showImagePicker = true
+                        } label: {
+                            Image(systemName: "photo")
+                                .foregroundStyle(.white)
+                                .padding(8)
+                                .background(Color.blue, in: Circle())
+                        }
+                        
+                        Button {
+                            resizeFrame(id: frame.id, increase: true)
+                        } label: {
+                            Image(systemName: "plus.magnifyingglass")
+                                .foregroundStyle(.white)
+                                .padding(8)
+                                .background(Color.green, in: Circle())
+                        }
+                        
+                        Button {
+                            resizeFrame(id: frame.id, increase: false)
+                        } label: {
+                            Image(systemName: "minus.magnifyingglass")
+                                .foregroundStyle(.white)
+                                .padding(8)
+                                .background(Color.orange, in: Circle())
+                        }
+                    }
+                    .position(x: x + w/2, y: y + h + 30)
+                }
+            }
+            
+            // Indicador de selección
+            if selectedFrameId == frame.id {
+                Rectangle()
+                    .strokeBorder(Color.yellow, lineWidth: 4)
+                    .frame(width: w + 8, height: h + 8)
+                    .position(x: x + w/2, y: y + h/2)
+            }
+        }
+        .onTapGesture {
+            if isEditMode {
+                selectedFrameId = selectedFrameId == frame.id ? nil : frame.id
+                HapticService.shared.impact(style: .medium)
+            }
+        }
                 } label: {
                     Image(systemName: "xmark.circle.fill")
                         .foregroundStyle(.red)
@@ -615,12 +740,29 @@ struct OffsiteCaptureDetailView: View {
     private func handleFrameTap(point: NormalizedPoint) {
         guard var currentData = data else { return }
         
+        // Usar dimensiones reales si hay metadata del LiDAR, sino usar tamaño por defecto
+        let defaultSize = AppConstants.OffsiteEditor.defaultFrameSize
+        var widthMeters: Double? = nil
+        var heightMeters: Double? = nil
+        
+        // Si hay metadata del LiDAR, usar dimensiones basadas en escala real
+        if let metadata = currentData.lidarMetadata, !metadata.planeDimensions.isEmpty {
+            // Usar promedio de dimensiones de planos como referencia
+            let avgWidth = metadata.planeDimensions.map { $0.width }.reduce(0, +) / Double(metadata.planeDimensions.count)
+            widthMeters = avgWidth * 0.15  // 15% del ancho promedio del plano
+            heightMeters = widthMeters! * 1.2  // Proporción típica de un cuadro
+        }
+        
         let newFrame = OffsiteFrame(
             topLeft: point,
-            width: AppConstants.OffsiteEditor.defaultFrameSize,
-            height: AppConstants.OffsiteEditor.defaultFrameSize,
+            width: defaultSize,
+            height: defaultSize,
             label: "Cuadro \(currentData.frames.count + 1)",
-            color: AppConstants.OffsiteEditor.availableColors.randomElement() ?? "#3B82F6"
+            color: AppConstants.OffsiteEditor.availableColors.randomElement() ?? "#3B82F6",
+            widthMeters: widthMeters,
+            heightMeters: heightMeters,
+            imageBase64: nil,
+            isCornerFrame: false
         )
         currentData.frames.append(newFrame)
         data = currentData
@@ -696,6 +838,7 @@ struct OffsiteCaptureDetailView: View {
         guard var currentData = data else { return }
         currentData.frames.removeAll { $0.id == id }
         data = currentData
+        selectedFrameId = nil
         HapticService.shared.impact(style: .light)
     }
     
@@ -704,6 +847,43 @@ struct OffsiteCaptureDetailView: View {
         currentData.textAnnotations.removeAll { $0.id == id }
         data = currentData
         HapticService.shared.impact(style: .light)
+    }
+    
+    // MARK: - Frame Edit Actions
+    
+    private func resizeFrame(id: UUID, increase: Bool) {
+        guard var currentData = data else { return }
+        guard let index = currentData.frames.firstIndex(where: { $0.id == id }) else { return }
+        
+        var frame = currentData.frames[index]
+        let delta = increase ? 0.02 : -0.02  // Incremento normalizado
+        
+        frame.width = max(0.05, min(0.5, frame.width + delta))
+        frame.height = max(0.05, min(0.5, frame.height + delta))
+        
+        // Actualizar dimensiones reales si existen
+        if let widthM = frame.widthMeters, let heightM = frame.heightMeters {
+            let ratio = frame.width / (frame.width - delta)
+            frame.widthMeters = widthM * ratio
+            frame.heightMeters = heightM * ratio
+        }
+        
+        currentData.frames[index] = frame
+        data = currentData
+        HapticService.shared.impact(style: .medium)
+    }
+    
+    private func updateFrameImage(id: UUID, image: UIImage) {
+        guard var currentData = data else { return }
+        guard let index = currentData.frames.firstIndex(where: { $0.id == id }) else { return }
+        
+        var frame = currentData.frames[index]
+        if let jpegData = image.jpegData(compressionQuality: 0.8) {
+            frame.imageBase64 = jpegData.base64EncodedString()
+            currentData.frames[index] = frame
+            data = currentData
+            HapticService.shared.notification(type: .success)
+        }
     }
     
     // MARK: - Save & Cancel
@@ -770,6 +950,53 @@ struct OffsiteCaptureDetailView: View {
         let w = imageSize.width * scale
         let h = imageSize.height * scale
         return CGPoint(x: (viewSize.width - w) / 2, y: (viewSize.height - h) / 2)
+    }
+}
+
+// MARK: - Image Picker
+
+import PhotosUI
+
+struct ImagePicker: UIViewControllerRepresentable {
+    @Binding var selectedImage: UIImage?
+    @Environment(\.dismiss) private var dismiss
+    
+    func makeUIViewController(context: Context) -> PHPickerViewController {
+        var config = PHPickerConfiguration()
+        config.filter = .images
+        config.selectionLimit = 1
+        
+        let picker = PHPickerViewController(configuration: config)
+        picker.delegate = context.coordinator
+        return picker
+    }
+    
+    func updateUIViewController(_ uiViewController: PHPickerViewController, context: Context) {}
+    
+    func makeCoordinator() -> Coordinator {
+        Coordinator(self)
+    }
+    
+    class Coordinator: NSObject, PHPickerViewControllerDelegate {
+        let parent: ImagePicker
+        
+        init(_ parent: ImagePicker) {
+            self.parent = parent
+        }
+        
+        func picker(_ picker: PHPickerViewController, didFinishPicking results: [PHPickerResult]) {
+            picker.dismiss(animated: true)
+            
+            guard let provider = results.first?.itemProvider else { return }
+            
+            if provider.canLoadObject(ofClass: UIImage.self) {
+                provider.loadObject(ofClass: UIImage.self) { image, _ in
+                    DispatchQueue.main.async {
+                        self.parent.selectedImage = image as? UIImage
+                    }
+                }
+            }
+        }
     }
 }
 

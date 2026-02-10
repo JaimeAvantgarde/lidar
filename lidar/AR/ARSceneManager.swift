@@ -349,13 +349,15 @@ final class ARSceneManager: NSObject {
     }
 
     /// Captura la vista AR actual con todas las mediciones y cuadros con posiciones 2D normalizadas.
+    /// Guarda TODOS los datos del LiDAR: dimensiones reales, imágenes de cuadros, metadata de planos.
     /// Usa `StorageService` para persistir imagen + JSON en Documents/OffsiteCaptures/.
     /// - Returns: (URL de la imagen, URL del JSON) o lanza error si falla.
     func captureForOffsite() throws -> (imageURL: URL, jsonURL: URL) {
         guard let sceneView = sceneView else { throw CaptureError.noSceneView }
         
         // Capturar con alta resolución (escala 2x en dispositivos retina)
-        UIGraphicsBeginImageContextWithOptions(sceneView.bounds.size, false, UIScreen.main.scale)
+        let scale = UIScreen.main.scale
+        UIGraphicsBeginImageContextWithOptions(sceneView.bounds.size, false, scale)
         defer { UIGraphicsEndImageContext() }
         
         sceneView.drawHierarchy(in: sceneView.bounds, afterScreenUpdates: true)
@@ -376,20 +378,20 @@ final class ARSceneManager: NSObject {
             return OffsiteMeasurement(id: m.id, distanceMeters: Double(m.distance), pointA: pointA, pointB: pointB, isFromAR: true)
         }
         
-        // Proyectar cuadros 3D a coordenadas 2D normalizadas
+        // Proyectar cuadros 3D a coordenadas 2D normalizadas CON TODOS LOS DATOS
         let offsiteFrames: [OffsiteFrame] = placedFrames.compactMap { frame in
             // Proyectar el centro del cuadro
             let frameNode = frame.node
             let framePosition = frameNode.simdWorldPosition
             let projected = sceneView.projectPoint(SCNVector3(framePosition))
             
-            // Calcular las dimensiones del cuadro proyectadas
-            let frameWidth = frame.size.width
-            let frameHeight = frame.size.height
+            // Dimensiones REALES del cuadro en metros
+            let frameWidthMeters = Double(frame.size.width)
+            let frameHeightMeters = Double(frame.size.height)
             
             // Proyectar las esquinas del cuadro para obtener dimensiones en 2D
-            let halfW = Float(frameWidth) / 2.0
-            let halfH = Float(frameHeight) / 2.0
+            let halfW = Float(frame.size.width) / 2.0
+            let halfH = Float(frame.size.height) / 2.0
             
             let topLeft3D = framePosition + simd_make_float3(-halfW, halfH, 0)
             let bottomRight3D = framePosition + simd_make_float3(halfW, -halfH, 0)
@@ -407,7 +409,45 @@ final class ARSceneManager: NSObject {
                 return nil
             }
             
+            // Convertir imagen a base64 para guardarla
+            var imageBase64: String?
+            if let frameImage = frame.image,
+               let jpegData = frameImage.jpegData(compressionQuality: 0.8) {
+                imageBase64 = jpegData.base64EncodedString()
+            }
+            
             return OffsiteFrame(
+                id: frame.id,
+                topLeft: topLeftNorm,
+                width: widthNorm,
+                height: heightNorm,
+                label: nil,
+                color: "#3B82F6",
+                widthMeters: frameWidthMeters,
+                heightMeters: frameHeightMeters,
+                imageBase64: imageBase64,
+                isCornerFrame: frame.isCornerFrame
+            )
+        }
+        
+        // Capturar metadata del LiDAR
+        let planeDims = detectedPlanes.map { plane in
+            (width: Double(plane.extent.x), height: Double(plane.extent.z))
+        }
+        let lidarMetadata = OffsiteLiDARMetadata(
+            isLiDARAvailable: isLiDARAvailable,
+            planeCount: detectedPlanes.count,
+            planeDimensions: planeDims
+        )
+        
+        let captureData = OffsiteCaptureData(
+            capturedAt: Date(),
+            measurements: offsiteMeasurements,
+            frames: offsiteFrames,
+            textAnnotations: [],
+            lidarMetadata: lidarMetadata,
+            imageScale: Double(scale)
+        )
                 id: frame.id,
                 topLeft: topLeftNorm,
                 width: widthNorm,

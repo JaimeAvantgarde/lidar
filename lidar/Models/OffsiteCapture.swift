@@ -61,18 +61,28 @@ struct OffsiteMeasurement: Codable, Identifiable, Hashable {
 struct OffsiteFrame: Codable, Identifiable, Hashable {
     var id: UUID
     let topLeft: NormalizedPoint
-    let width: Double  // Normalizado 0-1
-    let height: Double // Normalizado 0-1
+    let width: Double  // Normalizado 0-1 (posición en imagen)
+    let height: Double // Normalizado 0-1 (posición en imagen)
     var label: String?
     var color: String  // Hex color (#RRGGBB)
     
-    init(id: UUID = UUID(), topLeft: NormalizedPoint, width: Double, height: Double, label: String? = nil, color: String = "#3B82F6") {
+    // Nuevos campos: dimensiones reales del cuadro
+    var widthMeters: Double?  // Ancho real en metros
+    var heightMeters: Double? // Alto real en metros
+    var imageBase64: String?  // Imagen del cuadro en base64
+    var isCornerFrame: Bool   // Si es cuadro de esquina
+    
+    init(id: UUID = UUID(), topLeft: NormalizedPoint, width: Double, height: Double, label: String? = nil, color: String = "#3B82F6", widthMeters: Double? = nil, heightMeters: Double? = nil, imageBase64: String? = nil, isCornerFrame: Bool = false) {
         self.id = id
         self.topLeft = topLeft
         self.width = width
         self.height = height
         self.label = label
         self.color = color
+        self.widthMeters = widthMeters
+        self.heightMeters = heightMeters
+        self.imageBase64 = imageBase64
+        self.isCornerFrame = isCornerFrame
     }
 }
 
@@ -91,19 +101,36 @@ struct OffsiteTextAnnotation: Codable, Identifiable, Hashable {
     }
 }
 
+/// Metadata del LiDAR capturado (dimensiones de planos detectados)
+struct OffsiteLiDARMetadata: Codable, Equatable, Hashable {
+    let isLiDARAvailable: Bool
+    let planeCount: Int
+    let planeDimensions: [(width: Double, height: Double)]  // En metros
+    
+    init(isLiDARAvailable: Bool, planeCount: Int, planeDimensions: [(width: Double, height: Double)]) {
+        self.isLiDARAvailable = isLiDARAvailable
+        self.planeCount = planeCount
+        self.planeDimensions = planeDimensions
+    }
+}
+
 /// Datos de una captura offsite (JSON). La imagen se guarda con el mismo nombre base y extensión .jpg.
-struct OffsiteCaptureData: Codable {
+struct OffsiteCaptureData: Codable, Equatable {
     let capturedAt: Date
     var measurements: [OffsiteMeasurement]
     var frames: [OffsiteFrame]
     var textAnnotations: [OffsiteTextAnnotation]
     var lastModified: Date?
+    var lidarMetadata: OffsiteLiDARMetadata?  // Metadata del LiDAR
+    var imageScale: Double  // Escala de la imagen capturada
 
-    init(capturedAt: Date = Date(), measurements: [OffsiteMeasurement], frames: [OffsiteFrame] = [], textAnnotations: [OffsiteTextAnnotation] = [], lastModified: Date? = nil) {
+    init(capturedAt: Date = Date(), measurements: [OffsiteMeasurement], frames: [OffsiteFrame] = [], textAnnotations: [OffsiteTextAnnotation] = [], lastModified: Date? = nil, lidarMetadata: OffsiteLiDARMetadata? = nil, imageScale: Double = 1.0) {
         self.capturedAt = capturedAt
         self.measurements = measurements
         self.frames = frames
         self.textAnnotations = textAnnotations
         self.lastModified = lastModified
+        self.lidarMetadata = lidarMetadata
+        self.imageScale = imageScale
     }
 }
