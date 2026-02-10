@@ -9,71 +9,10 @@
 import ARKit
 import SceneKit
 import Observation
+import os.log
 
-/// Unidad de medida para distancias
-enum MeasurementUnit: String, CaseIterable {
-    case meters = "m"
-    case feet = "ft"
-
-    func format(distanceMeters: Float) -> String {
-        switch self {
-        case .meters:
-            return String(format: "%.2f m", distanceMeters)
-        case .feet:
-            let ft = distanceMeters * 3.28084
-            return String(format: "%.2f ft", ft)
-        }
-    }
-
-    func value(fromMeters meters: Float) -> Float {
-        switch self {
-        case .meters: return meters
-        case .feet: return meters * 3.28084
-        }
-    }
-}
-
-/// Una medición entre dos puntos (persistida en la escena).
-struct Measurement: Identifiable {
-    let id: UUID
-    let pointA: SIMD3<Float>
-    let pointB: SIMD3<Float>
-    let distance: Float
-
-    init(id: UUID = UUID(), pointA: SIMD3<Float>, pointB: SIMD3<Float>, distance: Float) {
-        self.id = id
-        self.pointA = pointA
-        self.pointB = pointB
-        self.distance = distance
-    }
-}
-
-/// Dimensiones detectadas de un plano (pared)
-struct PlaneDimensions {
-    let width: Float  // metros
-    let height: Float
-    let extent: SIMD3<Float>
-}
-
-/// Representa un cuadro/objeto colocado en la escena (foto de galería sobre pared o esquina)
-final class PlacedFrame: Identifiable {
-    let id: UUID
-    var node: SCNNode
-    var planeAnchor: ARPlaneAnchor?
-    var size: CGSize
-    var image: UIImage?
-    /// Si true, el cuadro tiene dos caras (esquina en L).
-    var isCornerFrame: Bool
-
-    init(id: UUID = UUID(), node: SCNNode, planeAnchor: ARPlaneAnchor? = nil, size: CGSize = CGSize(width: 0.5, height: 0.5), image: UIImage? = nil, isCornerFrame: Bool = false) {
-        self.id = id
-        self.node = node
-        self.planeAnchor = planeAnchor
-        self.size = size
-        self.image = image
-        self.isCornerFrame = isCornerFrame
-    }
-}
+// Models (MeasurementUnit, ARMeasurement, PlaneDimensions) → Models/MeasurementModels.swift
+// PlacedFrame → Models/PlacedFrame.swift
 
 @MainActor
 @Observable
@@ -98,7 +37,7 @@ final class ARSceneManager: NSObject {
     /// Marcador visible en la escena para el primer punto (para que se vea dónde se tomará el punto).
     var measurementFirstPointMarker: SCNNode?
     /// Lista de todas las mediciones.
-    var measurements: [Measurement] = []
+    var measurements: [ARMeasurement] = []
     /// Nodos en la escena por id de medición (línea + etiqueta + esferas en extremos).
     var measurementDisplayNodes: [UUID: SCNNode] = [:]
     /// Unidad para mostrar medidas: metros o pies (americanos).
@@ -114,8 +53,11 @@ final class ARSceneManager: NSObject {
 
     private var sceneView: ARSCNView?
     private let configuration = ARWorldTrackingConfiguration()
-    
-    override init() {
+    private let storageService: StorageServiceProtocol
+    private let logger = Logger(subsystem: Bundle.main.bundleIdentifier ?? "lidar", category: "ARScene")
+
+    init(storageService: StorageServiceProtocol = StorageService.shared) {
+        self.storageService = storageService
         super.init()
         checkLiDARSupport()
     }
@@ -269,7 +211,7 @@ final class ARSceneManager: NSObject {
         if let first = measurementFirstPoint {
             removeFirstPointMarker()
             let distance = simd_distance(first, position)
-            let measurement = Measurement(pointA: first, pointB: position, distance: distance)
+            let measurement = ARMeasurement(pointA: first, pointB: position, distance: distance)
             measurements.append(measurement)
             addMeasurementDisplay(measurement: measurement)
             measurementFirstPoint = nil
@@ -283,7 +225,7 @@ final class ARSceneManager: NSObject {
     private func showFirstPointMarker(at position: SIMD3<Float>) {
         removeFirstPointMarker()
         guard let sceneView = sceneView else { return }
-        let sphere = SCNSphere(radius: 0.02)
+        let sphere = SCNSphere(radius: AppConstants.AR.measurementPointRadius)
         sphere.firstMaterial?.diffuse.contents = UIColor.systemOrange
         sphere.firstMaterial?.emission.contents = UIColor.orange.withAlphaComponent(0.3)
         let node = SCNNode(geometry: sphere)
@@ -299,7 +241,7 @@ final class ARSceneManager: NSObject {
     }
 
     /// Añade a la escena la línea, etiqueta justo encima de la línea y esferas en los extremos.
-    private func addMeasurementDisplay(measurement: Measurement) {
+    private func addMeasurementDisplay(measurement: ARMeasurement) {
         guard let sceneView = sceneView else { return }
         let pointA = measurement.pointA
         let pointB = measurement.pointB
@@ -312,12 +254,12 @@ final class ARSceneManager: NSObject {
         let dir = simd_normalize(pointB - pointA)
         let worldUp = SIMD3<Float>(0, 1, 0)
         var axis = simd_cross(worldUp, dir)
-        if simd_length(axis) < 0.001 { axis = SIMD3<Float>(1, 0, 0) }
+        if simd_length(axis) < AppConstants.AR.minNormalLength { axis = SIMD3<Float>(1, 0, 0) }
         axis = simd_normalize(axis)
         let angle = acos(simd_dot(worldUp, dir))
 
-        let cylinder = SCNCylinder(radius: 0.005, height: CGFloat(length))
-        cylinder.radialSegmentCount = 8
+        let cylinder = SCNCylinder(radius: AppConstants.AR.measurementLineRadius, height: CGFloat(length))
+        cylinder.radialSegmentCount = AppConstants.AR.lineRadialSegments
         cylinder.firstMaterial?.diffuse.contents = UIColor.systemGreen
         cylinder.firstMaterial?.emission.contents = UIColor.green.withAlphaComponent(0.2)
         let lineNode = SCNNode(geometry: cylinder)
@@ -326,28 +268,30 @@ final class ARSceneManager: NSObject {
         parent.addChildNode(lineNode)
 
         let labelString = measurementUnit.format(distanceMeters: distance)
-        let text = SCNText(string: labelString, extrusionDepth: 0.006)
-        text.font = .systemFont(ofSize: 0.055, weight: .semibold)
+        let text = SCNText(string: labelString, extrusionDepth: AppConstants.AR.measurementTextExtrusion)
+        text.font = .systemFont(ofSize: AppConstants.AR.measurementTextFontSize, weight: .semibold)
         text.firstMaterial?.diffuse.contents = UIColor.white
         text.firstMaterial?.emission.contents = UIColor.darkGray
         text.firstMaterial?.isDoubleSided = true
         let textNode = SCNNode(geometry: text)
-        textNode.scale = SCNVector3(0.35, 0.35, 0.35)
+        let s = AppConstants.AR.measurementTextScale
+        textNode.scale = SCNVector3(s, s, s)
         let aboveLine = simd_cross(dir, worldUp)
-        let aboveNorm = simd_length(aboveLine) > 0.001 ? simd_normalize(aboveLine) : SIMD3<Float>(1, 0, 0)
-        textNode.position = SCNVector3(aboveNorm.x * 0.08, aboveNorm.y * 0.08, aboveNorm.z * 0.08)
+        let aboveNorm = simd_length(aboveLine) > AppConstants.AR.minNormalLength ? simd_normalize(aboveLine) : SIMD3<Float>(1, 0, 0)
+        let offset = AppConstants.AR.measurementTextOffset
+        textNode.position = SCNVector3(aboveNorm.x * offset, aboveNorm.y * offset, aboveNorm.z * offset)
         let billboard = SCNBillboardConstraint()
         billboard.freeAxes = .Y
         textNode.constraints = [billboard]
         parent.addChildNode(textNode)
 
-        let sphereGeo = SCNSphere(radius: 0.015)
+        let sphereGeo = SCNSphere(radius: AppConstants.AR.measurementEndpointRadius)
         sphereGeo.firstMaterial?.diffuse.contents = UIColor.systemGreen
         sphereGeo.firstMaterial?.emission.contents = UIColor.green.withAlphaComponent(0.2)
         let sphereA = SCNNode(geometry: sphereGeo)
         sphereA.position = SCNVector3((pointA.x - mid.x), (pointA.y - mid.y), (pointA.z - mid.z))
         parent.addChildNode(sphereA)
-        let sphereGeoB = SCNSphere(radius: 0.015)
+        let sphereGeoB = SCNSphere(radius: AppConstants.AR.measurementEndpointRadius)
         sphereGeoB.firstMaterial?.diffuse.contents = UIColor.systemGreen
         sphereGeoB.firstMaterial?.emission.contents = UIColor.green.withAlphaComponent(0.2)
         let sphereB = SCNNode(geometry: sphereGeoB)
@@ -404,7 +348,8 @@ final class ARSceneManager: NSObject {
         }
     }
 
-    /// Captura la vista AR actual y todas las mediciones con posiciones 2D normalizadas. Guarda imagen + JSON en Documents/OffsiteCaptures/.
+    /// Captura la vista AR actual y todas las mediciones con posiciones 2D normalizadas.
+    /// Usa `StorageService` para persistir imagen + JSON en Documents/OffsiteCaptures/.
     /// - Returns: (URL de la imagen, URL del JSON) o lanza error si falla.
     func captureForOffsite() throws -> (imageURL: URL, jsonURL: URL) {
         guard let sceneView = sceneView else { throw CaptureError.noSceneView }
@@ -413,19 +358,7 @@ final class ARSceneManager: NSObject {
         let h = sceneView.bounds.height
         guard w > 0, h > 0 else { throw CaptureError.invalidBounds }
 
-        let formatter = DateFormatter()
-        formatter.dateFormat = "yyyyMMdd_HHmmss"
-        let baseName = "capture_\(formatter.string(from: Date()))"
-        let fileManager = FileManager.default
-        guard let docs = fileManager.urls(for: .documentDirectory, in: .userDomainMask).first else {
-            throw CaptureError.saveFailed(NSError(domain: "FileManager", code: -1, userInfo: [NSLocalizedDescriptionKey: "No se pudo acceder a Documents"]))
-        }
-        let offsiteDir = docs.appendingPathComponent("OffsiteCaptures", isDirectory: true)
-        try? fileManager.createDirectory(at: offsiteDir, withIntermediateDirectories: true)
-        let imageURL = offsiteDir.appendingPathComponent("\(baseName).jpg")
-        let jsonURL = offsiteDir.appendingPathComponent("\(baseName).json")
-        let thumbURL = offsiteDir.appendingPathComponent("\(baseName)_thumb.jpg")
-
+        // Proyectar mediciones 3D a coordenadas 2D normalizadas
         let offsiteMeasurements: [OffsiteMeasurement] = measurements.map { m in
             let pa = sceneView.projectPoint(SCNVector3(m.pointA.x, m.pointA.y, m.pointA.z))
             let pb = sceneView.projectPoint(SCNVector3(m.pointB.x, m.pointB.y, m.pointB.z))
@@ -433,24 +366,16 @@ final class ARSceneManager: NSObject {
             let pointB = NormalizedPoint(x: Double(pb.x) / Double(w), y: Double(pb.y) / Double(h))
             return OffsiteMeasurement(id: m.id, distanceMeters: Double(m.distance), pointA: pointA, pointB: pointB, isFromAR: true)
         }
-        let data = OffsiteCaptureData(capturedAt: Date(), measurements: offsiteMeasurements, frames: [], textAnnotations: [])
+        let captureData = OffsiteCaptureData(capturedAt: Date(), measurements: offsiteMeasurements, frames: [], textAnnotations: [])
 
-        guard let jpeg = image.jpegData(compressionQuality: 0.9) else { throw CaptureError.imageEncodingFailed }
+        // Delegar persistencia al StorageService
         do {
-            try jpeg.write(to: imageURL)
-            
-            // Crear thumbnail optimizado
-            if let thumbnail = image.preparingThumbnail(of: CGSize(width: 200, height: 200)),
-               let thumbData = thumbnail.jpegData(compressionQuality: 0.7) {
-                try? thumbData.write(to: thumbURL)
-            }
-            
-            let encoder = JSONEncoder()
-            encoder.dateEncodingStrategy = .iso8601
-            encoder.outputFormatting = .prettyPrinted
-            try encoder.encode(data).write(to: jsonURL)
-            return (imageURL, jsonURL)
+            let files = try storageService.createCaptureFiles(image: image)
+            try storageService.saveCaptureData(captureData, to: files.jsonURL)
+            logger.info("Captura offsite guardada: \(files.baseName)")
+            return (files.imageURL, files.jsonURL)
         } catch {
+            logger.error("Error en captura offsite: \(error.localizedDescription)")
             throw CaptureError.saveFailed(error)
         }
     }
@@ -479,7 +404,7 @@ final class ARSceneManager: NSObject {
         let worldUp = SIMD3<Float>(0, 1, 0)
         var U = worldUp - simd_dot(worldUp, N) * N
         let len = simd_length(U)
-        if len < 0.001 {
+        if len < AppConstants.AR.minNormalLength {
             U = SIMD3<Float>(0, 1, 0)
         } else {
             U = U / len
@@ -513,9 +438,9 @@ final class ARSceneManager: NSObject {
     private func findCornerPlane(near position: SIMD3<Float>, from anchor: ARPlaneAnchor) -> ARPlaneAnchor? {
         guard anchor.alignment == .vertical else { return nil }
         let n1 = planeNormal(anchor)
-        let maxDistance: Float = 0.8
-        let minDotForCorner: Float = -0.3
-        let maxDotForCorner: Float = 0.3
+        let maxDistance = AppConstants.AR.cornerMaxDistance
+        let minDotForCorner = AppConstants.AR.cornerMinDot
+        let maxDotForCorner = AppConstants.AR.cornerMaxDot
         for other in detectedPlanes where other.identifier != anchor.identifier && other.alignment == .vertical {
             let n2 = planeNormal(other)
             let dot = simd_dot(n1, n2)
@@ -641,6 +566,7 @@ extension ARSceneManager: ARSessionDelegate {
     
     func session(_ session: ARSession, didFailWithError error: Error) {
         Task { @MainActor in
+            logger.error("Sesión AR falló: \(error.localizedDescription)")
             errorMessage = error.localizedDescription
         }
     }

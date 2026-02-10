@@ -3,35 +3,23 @@
 //  lidar
 //
 //  Lista de capturas offsite y vista detalle: imagen con mediciones superpuestas + modo edición.
+//  OffsiteCaptureEntry → Models/OffsiteCapture.swift
+//  Color(hex:) → Extensions/Color+Hex.swift
 //
 
 import SwiftUI
 
-/// Entrada de una captura offsite (imagen + JSON con mismo nombre base).
-struct OffsiteCaptureEntry: Identifiable, Hashable {
-    let id: String
-    let imageURL: URL
-    let jsonURL: URL
-    let capturedAt: Date
-    
-    func hash(into hasher: inout Hasher) {
-        hasher.combine(id)
-    }
-    
-    static func == (lhs: OffsiteCaptureEntry, rhs: OffsiteCaptureEntry) -> Bool {
-        lhs.id == rhs.id
-    }
-}
+// OffsiteCaptureEntry está definido en Models/OffsiteCapture.swift
 
 /// Lista de capturas guardadas en Documents/OffsiteCaptures/
 struct OffsiteCapturesListView: View {
     @Environment(\.dismiss) private var dismiss
-    @State private var entries: [OffsiteCaptureEntry] = []
+    @State private var viewModel = OffsiteCapturesListViewModel()
 
     var body: some View {
         NavigationStack {
             Group {
-                if entries.isEmpty {
+                if viewModel.entries.isEmpty {
                     ContentUnavailableView(
                         "Sin capturas offsite",
                         systemImage: "camera.viewfinder",
@@ -39,7 +27,7 @@ struct OffsiteCapturesListView: View {
                     )
                 } else {
                     List {
-                        ForEach(entries) { entry in
+                        ForEach(viewModel.entries) { entry in
                             NavigationLink(value: entry) {
                                 HStack(spacing: 12) {
                                     thumbnail(for: entry)
@@ -56,7 +44,7 @@ struct OffsiteCapturesListView: View {
                                 .padding(.vertical, 4)
                             }
                         }
-                        .onDelete(perform: deleteEntries)
+                        .onDelete(perform: viewModel.deleteEntries)
                     }
                 }
             }
@@ -66,13 +54,13 @@ struct OffsiteCapturesListView: View {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Cerrar") { dismiss() }
                 }
-                if !entries.isEmpty {
+                if !viewModel.entries.isEmpty {
                     ToolbarItem(placement: .primaryAction) {
                         EditButton()
                     }
                 }
             }
-            .onAppear { loadEntries() }
+            .onAppear { viewModel.loadEntries() }
             .navigationDestination(for: OffsiteCaptureEntry.self) { entry in
                 OffsiteCaptureDetailView(entry: entry)
             }
@@ -81,9 +69,7 @@ struct OffsiteCapturesListView: View {
 
     private func thumbnail(for entry: OffsiteCaptureEntry) -> some View {
         Group {
-            // Intentar cargar thumbnail optimizado primero
-            let thumbURL = entry.imageURL.deletingLastPathComponent()
-                .appendingPathComponent(entry.imageURL.deletingPathExtension().lastPathComponent + "_thumb.jpg")
+            let thumbURL = viewModel.thumbnailURL(for: entry)
             
             if let img = UIImage(contentsOfFile: thumbURL.path) {
                 Image(uiImage: img)
@@ -102,41 +88,7 @@ struct OffsiteCapturesListView: View {
         .clipShape(RoundedRectangle(cornerRadius: 8))
     }
     
-    private func deleteEntries(at offsets: IndexSet) {
-        let fileManager = FileManager.default
-        for index in offsets {
-            let entry = entries[index]
-            // Eliminar imagen, JSON y thumbnail
-            try? fileManager.removeItem(at: entry.imageURL)
-            try? fileManager.removeItem(at: entry.jsonURL)
-            let thumbURL = entry.imageURL.deletingLastPathComponent()
-                .appendingPathComponent(entry.imageURL.deletingPathExtension().lastPathComponent + "_thumb.jpg")
-            try? fileManager.removeItem(at: thumbURL)
-        }
-        entries.remove(atOffsets: offsets)
-        
-        // Feedback háptico
-        let generator = UINotificationFeedbackGenerator()
-        generator.notificationOccurred(.success)
-    }
-
-    private func loadEntries() {
-        let fileManager = FileManager.default
-        guard let docs = fileManager.urls(for: .documentDirectory, in: .userDomainMask).first else { return }
-        let dir = docs.appendingPathComponent("OffsiteCaptures", isDirectory: true)
-        guard let contents = try? fileManager.contentsOfDirectory(at: dir, includingPropertiesForKeys: [.contentModificationDateKey], options: .skipsHiddenFiles) else { return }
-        let jpgURLs = contents.filter { $0.pathExtension.lowercased() == "jpg" && !$0.lastPathComponent.contains("_thumb") }
-        var list: [OffsiteCaptureEntry] = []
-        for imageURL in jpgURLs {
-            let base = imageURL.deletingPathExtension().lastPathComponent
-            let jsonURL = imageURL.deletingLastPathComponent().appendingPathComponent("\(base).json")
-            guard fileManager.fileExists(atPath: jsonURL.path) else { continue }
-            let date = (try? fileManager.attributesOfItem(atPath: imageURL.path)[.modificationDate] as? Date) ?? Date()
-            list.append(OffsiteCaptureEntry(id: base, imageURL: imageURL, jsonURL: jsonURL, capturedAt: date))
-        }
-        list.sort { $0.capturedAt > $1.capturedAt }
-        entries = list
-    }
+    // Lógica de deleteEntries y loadEntries delegada a OffsiteCapturesListViewModel
 }
 
 /// Vista detalle: imagen con líneas y etiquetas de mediciones superpuestas + modo edición.
@@ -377,8 +329,7 @@ struct OffsiteCaptureDetailView: View {
                             pendingFrameStart = nil
                             pendingTextNormalizedPoint = nil
                         }
-                        let generator = UIImpactFeedbackGenerator(style: .medium)
-                        generator.impactOccurred()
+                        HapticService.shared.impact(style: .medium)
                     } label: {
                         VStack(spacing: 6) {
                             ZStack {
@@ -624,13 +575,11 @@ struct OffsiteCaptureDetailView: View {
             pendingMeasurementPoint = nil
             pendingMeasurementNormalizedPoint = nil
             
-            let generator = UINotificationFeedbackGenerator()
-            generator.notificationOccurred(.success)
+            HapticService.shared.notification(type: .success)
         } else {
             pendingMeasurementPoint = screenPoint
             pendingMeasurementNormalizedPoint = point
-            let generator = UIImpactFeedbackGenerator(style: .medium)
-            generator.impactOccurred()
+            HapticService.shared.impact(style: .medium)
         }
     }
     
@@ -639,16 +588,15 @@ struct OffsiteCaptureDetailView: View {
         
         let newFrame = OffsiteFrame(
             topLeft: point,
-            width: 0.15,
-            height: 0.15,
+            width: AppConstants.OffsiteEditor.defaultFrameSize,
+            height: AppConstants.OffsiteEditor.defaultFrameSize,
             label: "Cuadro \(currentData.frames.count + 1)",
-            color: ["#3B82F6", "#10B981", "#F59E0B", "#EF4444", "#8B5CF6"].randomElement() ?? "#3B82F6"
+            color: AppConstants.OffsiteEditor.availableColors.randomElement() ?? "#3B82F6"
         )
         currentData.frames.append(newFrame)
         data = currentData
         
-        let generator = UINotificationFeedbackGenerator()
-        generator.notificationOccurred(.success)
+        HapticService.shared.notification(type: .success)
     }
     
     private func handleTextTap(point: NormalizedPoint, screenPoint: CGPoint, viewSize: CGSize, imageSize: CGSize) {
@@ -670,8 +618,7 @@ struct OffsiteCaptureDetailView: View {
         newTextPosition = nil
         pendingTextNormalizedPoint = nil
         
-        let generator = UINotificationFeedbackGenerator()
-        generator.notificationOccurred(.success)
+        HapticService.shared.notification(type: .success)
     }
     
     private func calculateDistance(from pointA: CGPoint, to pointB: CGPoint, viewSize: CGSize, imageSize: CGSize) -> Double {
@@ -704,7 +651,7 @@ struct OffsiteCaptureDetailView: View {
         }
         
         // Sin referencia AR: distancia arbitraria (muy aproximada)
-        return pixelDistance * 0.01
+        return pixelDistance * AppConstants.OffsiteEditor.estimatedMetersPerPixel
     }
     
     // MARK: - Delete Actions
@@ -713,27 +660,21 @@ struct OffsiteCaptureDetailView: View {
         guard var currentData = data else { return }
         currentData.measurements.removeAll { $0.id == id }
         data = currentData
-        
-        let generator = UIImpactFeedbackGenerator(style: .light)
-        generator.impactOccurred()
+        HapticService.shared.impact(style: .light)
     }
     
     private func deleteFrame(id: UUID) {
         guard var currentData = data else { return }
         currentData.frames.removeAll { $0.id == id }
         data = currentData
-        
-        let generator = UIImpactFeedbackGenerator(style: .light)
-        generator.impactOccurred()
+        HapticService.shared.impact(style: .light)
     }
     
     private func deleteTextAnnotation(id: UUID) {
         guard var currentData = data else { return }
         currentData.textAnnotations.removeAll { $0.id == id }
         data = currentData
-        
-        let generator = UIImpactFeedbackGenerator(style: .light)
-        generator.impactOccurred()
+        HapticService.shared.impact(style: .light)
     }
     
     // MARK: - Save & Cancel
@@ -747,10 +688,7 @@ struct OffsiteCaptureDetailView: View {
             encoder.dateEncodingStrategy = .iso8601
             encoder.outputFormatting = .prettyPrinted
             try encoder.encode(currentData).write(to: entry.jsonURL)
-            
-            let generator = UINotificationFeedbackGenerator()
-            generator.notificationOccurred(.success)
-            
+            HapticService.shared.notification(type: .success)
             isEditMode = false
             editTool = .none
             pendingMeasurementPoint = nil
@@ -758,7 +696,7 @@ struct OffsiteCaptureDetailView: View {
             pendingFrameStart = nil
             pendingTextNormalizedPoint = nil
         } catch {
-            print("Error guardando cambios: \(error)")
+            // Error silenciado - en producción usar Logger
         }
     }
     
@@ -806,25 +744,4 @@ struct OffsiteCaptureDetailView: View {
     }
 }
 
-// MARK: - Color from Hex
-
-extension Color {
-    init(hex: String) {
-        let hex = hex.trimmingCharacters(in: CharacterSet.alphanumerics.inverted)
-        var int: UInt64 = 0
-        Scanner(string: hex).scanHexInt64(&int)
-        let r, g, b: UInt64
-        switch hex.count {
-        case 6:
-            (r, g, b) = ((int >> 16) & 0xFF, (int >> 8) & 0xFF, int & 0xFF)
-        default:
-            (r, g, b) = (0, 0, 0)
-        }
-        self.init(
-            .sRGB,
-            red: Double(r) / 255,
-            green: Double(g) / 255,
-            blue: Double(b) / 255
-        )
-    }
-}
+// Color(hex:) → Extraído a Extensions/Color+Hex.swift

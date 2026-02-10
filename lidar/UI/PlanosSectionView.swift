@@ -36,8 +36,8 @@ struct PlanosSectionView: View {
                         Label("Plano detectado", systemImage: "rectangle.on.rectangle.angled")
                             .font(.headline)
                         HStack(spacing: 24) {
-                            DimensionRow(value: dims.width, unit: "m", label: "Ancho")
-                            DimensionRow(value: dims.height, unit: "m", label: "Alto")
+                            DimensionRowView(value: dims.width, unit: "m", label: "Ancho")
+                            DimensionRowView(value: dims.height, unit: "m", label: "Alto")
                         }
                         Text("Mueve el dispositivo para que se actualicen las dimensiones del plano.")
                             .font(.caption)
@@ -75,20 +75,4 @@ struct PlanosSectionView: View {
     }
 }
 
-private struct DimensionRow: View {
-    let value: Float
-    let unit: String
-    let label: String
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 2) {
-            Text(label)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-            Text(String(format: "%.2f %@", value, unit))
-                .font(.title2)
-                .fontWeight(.semibold)
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-    }
-}
+// DimensionRow → Extraído a UI/Components/DimensionRowView.swift

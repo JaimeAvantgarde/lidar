@@ -1,5 +1,194 @@
 # Changelog - lidar App
 
+## [2.0.0] - 2026-02-10 🏗️ REFACTOR ARQUITECTÓNICO
+
+### 🏗️ Arquitectura MVVM + Services
+
+#### Nueva estructura de carpetas
+```
+lidar/
+├── Constants/        # Todas las constantes centralizadas
+├── Models/           # Modelos de dominio separados por responsabilidad
+├── Services/         # Capa de servicios con protocolos
+├── ViewModels/       # Lógica de presentación separada de vistas
+├── AR/               # Capa de ARKit
+├── UI/
+│   ├── Components/   # Componentes reutilizables
+│   └── ...          # Vistas principales
+└── Extensions/       # Extensiones Swift
+```
+
+#### Servicios creados
+- **HapticService**: Feedback háptico centralizado
+  - Protocolo `HapticServiceProtocol` para DI
+  - `MockHapticService` para tests
+  - Elimina 15+ duplicaciones de `UIFeedbackGenerator`
+- **StorageService**: Persistencia JSON e imágenes
+  - Protocolo `StorageServiceProtocol` para DI
+  - `MockStorageService` para tests
+  - Maneja FileManager, codificación y thumbnails
+  - Logging con `os.log`
+
+#### Constants (`AppConstants`)
+- **Layout**: Zonas de exclusión, paddings, corner radius
+- **AR**: Tamaños de objetos 3D, umbrales de detección
+- **Capture**: Calidad JPEG, tamaños de thumbnail
+- **Measurement**: Factores de conversión, rangos de zoom
+- **Cuadros**: Rangos de tamaño, aspect ratio
+- **OffsiteEditor**: Tamaños normalizados, colores
+- **Animation**: Springs, duraciones
+
+**Eliminados 50+ magic numbers** del código
+
+#### ViewModels creados
+- **OffsiteCapturesListViewModel**:
+  - Gestión de lista de capturas
+  - Delegación a `StorageService`
+  - Separado de la vista (antes 831 líneas)
+- **OffsiteCaptureDetailViewModel**:
+  - Lógica de edición de capturas
+  - Cálculo de distancias offsite
+  - Gestión de herramientas de edición
+
+#### Componentes UI extraídos
+- **MeasurementRowView**: Fila de medición reutilizable
+- **CuadroRowView**: Fila de cuadro reutilizable
+- **DimensionRowView**: Fila de dimensión reutilizable
+
+Antes: Duplicados en cada sección  
+Después: Componentes compartidos con accesibilidad
+
+#### Modelos refactorizados
+**MeasurementModels.swift**:
+- `MeasurementUnit` (extraído de ARSceneManager)
+- `ARMeasurement` (renombrado de `Measurement`)
+- `PlaneDimensions` (extraído)
+
+**PlacedFrame.swift**:
+- Extraído de ARSceneManager a su propio archivo
+- Usa `AppConstants.AR.defaultFrameSize`
+
+**OffsiteCapture.swift**:
+- `OffsiteCaptureEntry` añadido (antes en view)
+- `NormalizedPoint.isValid` validación añadida
+
+#### ARSceneManager refactorizado
+- ✅ Tipos extraídos a Models/
+- ✅ Inyección de `StorageService`
+- ✅ Usa `AppConstants` en lugar de literales
+- ✅ Logging con `os.log`
+- ✅ Delegación de persistencia a servicio
+- Reducción: **653 → 580 líneas** (-11%)
+
+#### ARViewRepresentable refactorizado
+- ✅ **Eliminado force unwrap** (`var sceneManager: ARSceneManager?`)
+- ✅ **Deprecated API reemplazada**: `hitTest()` → `raycast()`
+- ✅ Usa `HapticService` en lugar de generators inline
+- ✅ Usa `AppConstants.Layout` para zonas de exclusión
+- ✅ Método `performRaycast()` encapsula lógica de raycast
+
+#### ContentView refactorizado
+- ✅ Usa `HapticService`
+- ✅ Usa `AppConstants.Layout` y `AppConstants.Animation`
+- Código más limpio y mantenible
+
+#### Secciones refactorizadas
+**MedidasSectionView**:
+- Usa `MeasurementRowView` extraído
+- Usa `HapticService`
+- Usa `AppConstants.Measurement`
+
+**CuadrosSectionView**:
+- Usa `CuadroRowView` extraído
+- Usa `AppConstants.Cuadros`
+- Eliminada duplicación de estructura `CuadroRow`
+
+**PlanosSectionView**:
+- Usa `DimensionRowView` extraído
+- Componente reutilizable con accesibilidad
+
+#### OffsiteCapturesView refactorizado
+- ✅ Usa `OffsiteCapturesListViewModel`
+- ✅ Usa `HapticService`
+- ✅ Usa `AppConstants.OffsiteEditor`
+- ✅ `Color(hex:)` extraído a Extensions/
+- Reducción: **831 → ~400 líneas** (-52%)
+
+### 🧪 Testing
+
+#### Tests unitarios creados
+- **MeasurementModelsTests**: 8 tests
+  - Format meters/feet
+  - Value conversion
+  - ARMeasurement equality
+  - PlaneDimensions equality
+- **HapticServiceTests**: 3 tests
+  - Mock impact tracking
+  - Mock notification tracking
+  - Reset functionality
+- **StorageServiceTests**: 7 tests
+  - Mock load/save/delete
+  - Error handling
+  - Create capture files
+- **OffsiteCaptureTests**: 11 tests
+  - NormalizedPoint validation
+  - OffsiteMeasurement flags
+  - OffsiteFrame defaults
+  - OffsiteCaptureEntry hashable
+- **AppConstantsTests**: 11 tests
+  - Validación de rangos
+  - Valores positivos
+  - Consistencia de constantes
+
+**Total: 5 suites, 40+ tests**
+
+### 📚 Documentación
+
+#### README actualizado
+- ✅ Sección arquitectura MVVM + Services
+- ✅ Estructura de carpetas actualizada
+- ✅ Sección de testing con comandos
+- ✅ Métricas de calidad de código
+- ✅ Tabla de mejoras (antes/después)
+
+#### Comentarios y logging
+- `os.log` en ARSceneManager
+- `os.log` en StorageService
+- Comentarios DocC en servicios
+
+### 🔧 Mejoras técnicas
+
+#### Separación de responsabilidades
+- **Antes**: Lógica de negocio en vistas (I/O, cálculos)
+- **Después**: Vistas puras + ViewModels + Servicios
+
+#### Dependency Injection
+- **Antes**: `@State private var sceneManager = ARSceneManager()`
+- **Después**: Servicios inyectados via protocolos
+
+#### Testability
+- **Antes**: 0 tests, código acoplado a UIKit
+- **Después**: Mocks + protocolos, 40+ tests
+
+#### Code quality
+- **Magic numbers**: 50+ → 0
+- **Force unwraps**: Varios → 0 (producción)
+- **Deprecated APIs**: `hitTest()` → `raycast()`
+- **Duplicación**: Generators repetidos → Service
+- **Archivos largos**: 831 líneas → 400 líneas
+
+### 🎯 Principios SOLID aplicados
+
+| Principio | Implementación |
+|---|---|
+| **S** Single Responsibility | ViewModels, Services separados |
+| **O** Open/Closed | Protocolos permiten extensión sin modificación |
+| **L** Liskov Substitution | Mocks intercambiables con implementaciones reales |
+| **I** Interface Segregation | Protocolos específicos (HapticServiceProtocol, etc.) |
+| **D** Dependency Inversion | Dependencias via protocolos, no implementaciones |
+
+---
+
 ## [1.2.0] - 2026-02-09
 
 ### ✨ Nuevas características - Edición Offsite

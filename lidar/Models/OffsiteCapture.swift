@@ -8,13 +8,39 @@
 import Foundation
 import UIKit
 
+// MARK: - Offsite Capture Entry
+
+/// Entrada de una captura offsite (imagen + JSON con mismo nombre base).
+/// Usado para listar capturas en la UI.
+struct OffsiteCaptureEntry: Identifiable, Hashable {
+    let id: String
+    let imageURL: URL
+    let jsonURL: URL
+    let capturedAt: Date
+
+    func hash(into hasher: inout Hasher) {
+        hasher.combine(id)
+    }
+
+    static func == (lhs: OffsiteCaptureEntry, rhs: OffsiteCaptureEntry) -> Bool {
+        lhs.id == rhs.id
+    }
+}
+
+// MARK: - Normalized Point
+
 /// Posición 2D normalizada en la imagen (0–1). x = 0 izquierda, 1 derecha; y = 0 arriba, 1 abajo.
 struct NormalizedPoint: Codable, Equatable, Hashable {
     let x: Double
     let y: Double
+
+    /// Valida que el punto esté dentro del rango normalizado [0, 1].
+    var isValid: Bool {
+        (0...1).contains(x) && (0...1).contains(y)
+    }
 }
 
-/// Una medición guardada para offsite: distancia en metros y puntos 2D en la imagen.
+// MARK: - Offsite Measurement
 struct OffsiteMeasurement: Codable, Identifiable, Hashable {
     var id: UUID
     let distanceMeters: Double

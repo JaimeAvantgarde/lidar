@@ -2,15 +2,26 @@
 //  lidarTests.swift
 //  lidarTests
 //
-//  Created by Jaime Pareja Arco on 9/2/26.
+//  Tests unitarios para la app lidar.
+//  Tests específicos por módulo están en archivos separados.
 //
 
 import Testing
 
-struct lidarTests {
+// Los tests se han organizado en:
+// - MeasurementModelsTests.swift: Modelos de medición
+// - HapticServiceTests.swift: Servicio háptico
+// - StorageServiceTests.swift: Servicio de persistencia
+// - OffsiteCaptureTests.swift: Modelos de captura offsite
+// - AppConstantsTests.swift: Validación de constantes
 
-    @Test func example() async throws {
-        // Write your test here and use APIs like `#expect(...)` to check expected conditions.
+@Suite("lidar Core Tests")
+struct lidarCoreTests {
+
+    @Test("Placeholder test")
+    func placeholderTest() async throws {
+        // Test de integración básica
+        #expect(true)
     }
-
 }
+

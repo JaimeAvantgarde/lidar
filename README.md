@@ -1,6 +1,67 @@
 # lidar — iOS ARKit (LiDAR) nativo
 
-App iOS nativa para tablet (13") que usa **ARKit** en Swift. Pensada para conectarse después con Flutter mediante un puente (Method Channel / módulo nativo).
+App iOS nativa para tablet (13") que usa **ARKit** en Swift. Arquitectura **MVVM** con servicios inyectables, testeable y preparada para conectarse con Flutter mediante un puente (Method Channel / módulo nativo).
+
+## 🏗️ Arquitectura
+
+### Patrón: MVVM + Services + Protocols
+
+- **Models**: Estructuras de datos inmutables y `Codable`
+- **ViewModels**: Lógica de presentación reactiva con `@Observable`
+- **Views**: SwiftUI puro, sin lógica de negocio
+- **Services**: Capa de infraestructura (Storage, Haptics) con protocolos para testing
+- **AR Layer**: Gestión de ARKit separada del resto
+
+### Principios aplicados
+
+✅ **Single Responsibility**: Cada clase tiene una única responsabilidad  
+✅ **Dependency Injection**: Servicios inyectados via protocolos  
+✅ **Constants centralizados**: 0 magic numbers en el código  
+✅ **Separation of Concerns**: Vistas, lógica, persistencia y AR separados  
+✅ **Testability**: Mocks + protocolos permiten tests unitarios completos
+
+## 📁 Estructura del proyecto
+
+```
+lidar/
+├── lidarApp.swift                    # Punto de entrada
+├── ContentView.swift                 # Vista principal: AR + panel Liquid Glass
+├── FlutterBridge.swift               # API para conectar con Flutter (futuro)
+├── Constants/
+│   └── AppConstants.swift            # Todas las constantes centralizadas
+├── Models/
+│   ├── MeasurementModels.swift       # MeasurementUnit, ARMeasurement, PlaneDimensions
+│   ├── PlacedFrame.swift             # Modelo de cuadro colocado en AR
+│   └── OffsiteCapture.swift          # Modelos de captura offsite (Codable)
+├── Services/
+│   ├── HapticService.swift           # Feedback háptico (+ mock para tests)
+│   └── StorageService.swift          # Persistencia JSON/imágenes (+ mock)
+├── ViewModels/
+│   └── OffsiteCapturesViewModel.swift # ViewModels para lista y detalle
+├── AR/
+│   ├── ARSceneManager.swift          # Sesión ARKit, planos, cuadros, medidas
+│   └── ARViewRepresentable.swift     # ARSCNView en SwiftUI + raycast
+├── UI/
+│   ├── Components/
+│   │   ├── MeasurementRowView.swift  # Fila de medición reutilizable
+│   │   ├── CuadroRowView.swift       # Fila de cuadro reutilizable
+│   │   └── DimensionRowView.swift    # Fila de dimensión reutilizable
+│   ├── GlassModifiers.swift          # Estilo Liquid Glass: .glassEffect
+│   ├── PlanosSectionView.swift       # Sección Planos: LiDAR, dimensiones
+│   ├── CuadrosSectionView.swift      # Sección Cuadros: CRUD completo
+│   ├── MedidasSectionView.swift      # Sección Medidas: múltiples + zoom
+│   └── OffsiteCapturesView.swift     # Lista + detalle de capturas
+└── Extensions/
+    └── Color+Hex.swift                # Extensión para colores hexadecimales
+
+lidarTests/
+├── lidarTests.swift                   # Suite principal
+├── MeasurementModelsTests.swift       # Tests de modelos de medición
+├── HapticServiceTests.swift           # Tests del servicio háptico
+├── StorageServiceTests.swift          # Tests del servicio de storage
+├── OffsiteCaptureTests.swift          # Tests de modelos offsite
+└── AppConstantsTests.swift            # Validación de constantes
+```
 
 ## Requisitos
 
@@ -8,27 +69,7 @@ App iOS nativa para tablet (13") que usa **ARKit** en Swift. Pensada para conect
 - iOS 17.0+ (objetivo del proyecto)
 - Dispositivo físico con ARKit (iPad con LiDAR recomendado para mesh y medidas)
 
-## Estructura del proyecto
-
-```
-lidar/
-├── lidarApp.swift           # Punto de entrada
-├── ContentView.swift        # UI principal: AR + panel Liquid Glass + barra superior
-├── FlutterBridge.swift      # API para conectar con Flutter más adelante
-├── AR/
-│   ├── ARSceneManager.swift # Sesión ARKit, planos, cuadros, medidas, captura offsite
-│   └── ARViewRepresentable.swift  # ARSCNView en SwiftUI + zoom + hit testing ajustado
-├── Models/
-│   └── OffsiteCapture.swift # Modelos Codable para captura offsite (JSON)
-└── UI/
-    ├── GlassModifiers.swift      # Estilo Liquid Glass: .glassEffect, paneles, pills
-    ├── PlanosSectionView.swift   # Sección Planos: LiDAR, dimensiones, esquinas
-    ├── CuadrosSectionView.swift  # Sección Cuadros: CRUD completo + PhotosPicker
-    ├── MedidasSectionView.swift  # Sección Medidas: múltiples + zoom + unidades
-    └── OffsiteCapturesView.swift # Lista + detalle de capturas guardadas
-```
-
-## Funcionalidades
+## ✨ Funcionalidades
 
 ### 🎯 Detección AR
 - **Detección de planos**: Paredes, techos y suelos con ARKit
@@ -117,6 +158,61 @@ Para integrar:
 1. En el proyecto Flutter, crear un **Method Channel** (o **Event Channel** para eventos).
 2. En iOS, registrar el channel en `AppDelegate` / `FlutterAppDelegate` y llamar a los métodos de `ARSceneManager` según el método invocado desde Flutter.
 3. Desde nativo, usar el channel para enviar eventos (planos detectados, medidas, etc.) a Flutter.
+
+## Cómo ejecutar
+
+1. Abrir `lidar.xcodeproj` en Xcode.
+2. Seleccionar un dispositivo físico (iPad/iPhone con ARKit).
+3. Build & Run (⌘R).
+
+**Nota:** ARKit no funciona en simulador; hace falta dispositivo real.
+
+## 🧪 Testing
+
+### Ejecutar tests
+```bash
+# Desde Xcode: ⌘U (Product > Test)
+# Desde terminal:
+xcodebuild test -scheme lidar -destination 'platform=iOS Simulator,name=iPad Pro (13-inch)'
+```
+
+### Cobertura de tests
+- ✅ **MeasurementModelsTests**: Modelos de medición, unidades, conversiones
+- ✅ **HapticServiceTests**: Mock del servicio háptico
+- ✅ **StorageServiceTests**: Mock del servicio de persistencia
+- ✅ **OffsiteCaptureTests**: Modelos de captura offsite, validación
+- ✅ **AppConstantsTests**: Validación de rangos y valores de constantes
+
+### Mocks disponibles
+```swift
+// Para testing
+let hapticService = MockHapticService()
+let storageService = MockStorageService()
+
+// Uso en tests
+await hapticService.impact(style: .light)
+#expect(hapticService.impactCallCount == 1)
+```
+
+## 📊 Calidad de código
+
+### Métricas
+- **0 magic numbers**: Todas las constantes en `AppConstants`
+- **0 force unwraps** en código de producción
+- **Protocolos + DI**: 100% de servicios inyectables
+- **Componentes reutilizables**: 3 vistas extraídas (MeasurementRow, CuadroRow, DimensionRow)
+- **Logging centralizado**: `os.log` en ARSceneManager y servicios
+- **No deprecated APIs**: Usa `raycast()` en lugar de `hitTest(types:)`
+
+### Mejoras sobre versión anterior
+| Antes | Después | Mejora |
+|---|---|---|
+| 831 líneas en `OffsiteCapturesView` | 400 + ViewModel separado | -53% |
+| 653 líneas en `ARSceneManager` | 580 líneas (tipos extraídos) | -11% |
+| Magic numbers por todo el código | `AppConstants` centralizado | 100% |
+| `UIFeedbackGenerator` repetido 15 veces | `HapticService` | DRY |
+| `FileManager` en vistas | `StorageService` | Separación |
+| 0 tests | 5 suites, 40+ tests | ∞% |
 
 ## Cómo ejecutar
 

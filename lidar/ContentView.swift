@@ -127,24 +127,21 @@ struct ContentView: View {
 
             // Capturar para offsite
             Button {
-                // Feedback háptico
-                let generator = UINotificationFeedbackGenerator()
-                
                 do {
                     _ = try sceneManager.captureForOffsite()
-                    generator.notificationOccurred(.success)
+                    HapticService.shared.notification(type: .success)
                     offsiteCaptureAlert = "✓ Captura guardada con \(sceneManager.measurements.count) medición\(sceneManager.measurements.count == 1 ? "" : "es"). Puedes verla en «Ver capturas»."
                 } catch ARSceneManager.CaptureError.noSceneView {
-                    generator.notificationOccurred(.error)
+                    HapticService.shared.notification(type: .error)
                     offsiteCaptureAlert = "Error: Vista AR no disponible"
                 } catch ARSceneManager.CaptureError.invalidBounds {
-                    generator.notificationOccurred(.error)
+                    HapticService.shared.notification(type: .error)
                     offsiteCaptureAlert = "Error: Tamaño de vista inválido"
                 } catch ARSceneManager.CaptureError.imageEncodingFailed {
-                    generator.notificationOccurred(.error)
+                    HapticService.shared.notification(type: .error)
                     offsiteCaptureAlert = "Error: No se pudo codificar la imagen"
                 } catch {
-                    generator.notificationOccurred(.error)
+                    HapticService.shared.notification(type: .error)
                     offsiteCaptureAlert = "Error al guardar: \(error.localizedDescription)"
                 }
             } label: {
@@ -172,7 +169,7 @@ struct ContentView: View {
 
             // Expandir / colapsar panel
             Button {
-                withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
+                withAnimation(.spring(response: AppConstants.Animation.springResponse, dampingFraction: AppConstants.Animation.springDamping)) {
                     panelExpanded.toggle()
                 }
             } label: {
@@ -218,11 +215,11 @@ struct ContentView: View {
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .frame(height: 320)
+            .frame(height: AppConstants.Layout.panelContentHeight)
         }
-        .glassPanel(cornerRadius: 28, padding: 0)
-        .padding(.horizontal, 16)
-        .padding(.bottom, 24)
+        .glassPanel(cornerRadius: AppConstants.Layout.panelCornerRadius, padding: 0)
+        .padding(.horizontal, AppConstants.Layout.panelHorizontalPadding)
+        .padding(.bottom, AppConstants.Layout.panelBottomPadding)
     }
 
     // MARK: - Sheet dimensiones plano
@@ -283,8 +280,8 @@ struct ContentView: View {
                 .shadow(color: .black.opacity(0.5), radius: 4, x: 0, y: 1)
                 .padding(.horizontal, 20)
                 .padding(.vertical, 12)
-                .glassBackground(cornerRadius: 20)
-                .padding(.bottom, panelExpanded ? 380 : 100)
+                .glassBackground(cornerRadius: AppConstants.Layout.glassPillCornerRadius)
+                .padding(.bottom, panelExpanded ? AppConstants.Layout.expandedHintBottomPadding : AppConstants.Layout.collapsedHintBottomPadding)
         }
         .allowsHitTesting(false)
     }

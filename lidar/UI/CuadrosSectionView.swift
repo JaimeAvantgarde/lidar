@@ -10,7 +10,7 @@ import PhotosUI
 
 struct CuadrosSectionView: View {
     var sceneManager: ARSceneManager
-    @State private var resizeValue: CGFloat = 0.5
+    @State private var resizeValue: CGFloat = AppConstants.Cuadros.defaultSize
     @State private var selectedPhotoItem: PhotosPickerItem?
     @State private var selectedPhotoForFrame: PhotosPickerItem?
     /// ID del cuadro para el que se abre el sheet "Cambiar foto" (nil = cerrado).
@@ -67,8 +67,8 @@ struct CuadrosSectionView: View {
                             .buttonStyle(.bordered)
 
                             Button {
-                                sceneManager.replaceFrame(id: frame.id, withNewSize: CGSize(width: 0.6, height: 0.48))
-                                resizeValue = 0.6
+                                sceneManager.replaceFrame(id: frame.id, withNewSize: AppConstants.Cuadros.replaceSize)
+                                resizeValue = AppConstants.Cuadros.replaceSize.width
                             } label: {
                                 Label("Cambiar", systemImage: "arrow.triangle.2.circlepath")
                                     .font(.subheadline)
@@ -80,9 +80,9 @@ struct CuadrosSectionView: View {
                             Text("Tamaño")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
-                            Slider(value: $resizeValue, in: 0.2...1.5, step: 0.05)
+                            Slider(value: $resizeValue, in: AppConstants.Cuadros.minSize...AppConstants.Cuadros.maxSize, step: AppConstants.Cuadros.sizeStep)
                                 .onChange(of: resizeValue) { _, newValue in
-                                    sceneManager.resizeFrame(id: frame.id, newSize: CGSize(width: newValue, height: newValue * 0.8))
+                                    sceneManager.resizeFrame(id: frame.id, newSize: CGSize(width: newValue, height: newValue * AppConstants.Cuadros.aspectRatio))
                                 }
                             Text(String(format: "%.2f m", resizeValue))
                                 .font(.caption)
@@ -138,7 +138,7 @@ struct CuadrosSectionView: View {
                             .font(.caption)
                             .foregroundStyle(.secondary)
                         ForEach(sceneManager.placedFrames) { frame in
-                            CuadroRow(
+                            CuadroRowView(
                                 frame: frame,
                                 isSelected: sceneManager.selectedFrameId == frame.id,
                                 onSelect: {
@@ -220,71 +220,4 @@ private struct ChangeFramePhotoSheet: View {
     }
 }
 
-private struct CuadroRow: View {
-    let frame: PlacedFrame
-    let isSelected: Bool
-    let onSelect: () -> Void
-    let onChangePhoto: () -> Void
-
-    var body: some View {
-        HStack(spacing: 12) {
-            Button(action: onSelect) {
-                HStack(spacing: 12) {
-                    Group {
-                        if let img = frame.image {
-                            Image(uiImage: img)
-                                .resizable()
-                                .scaledToFill()
-                                .frame(width: 44, height: 44)
-                                .clipShape(RoundedRectangle(cornerRadius: 8))
-                        } else {
-                            RoundedRectangle(cornerRadius: 8)
-                                .fill(.quaternary)
-                                .frame(width: 44, height: 44)
-                                .overlay {
-                                    Image(systemName: "photo.artframe")
-                                        .font(.title2)
-                                        .foregroundStyle(.secondary)
-                                }
-                        }
-                    }
-                    VStack(alignment: .leading, spacing: 2) {
-                        HStack(spacing: 6) {
-                            Text("Cuadro")
-                                .font(.subheadline)
-                                .fontWeight(.medium)
-                            if frame.isCornerFrame {
-                                Text("Esquina")
-                                    .font(.caption2)
-                                    .foregroundStyle(.secondary)
-                                    .padding(.horizontal, 6)
-                                    .padding(.vertical, 2)
-                                    .background(Color.secondary.opacity(0.2))
-                                    .clipShape(Capsule())
-                            }
-                        }
-                        Text(String(format: "%.2f × %.2f m", frame.size.width, frame.size.height))
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                    Spacer()
-                    if isSelected {
-                        Image(systemName: "checkmark.circle.fill")
-                            .foregroundStyle(Color.accentColor)
-                    }
-                }
-                .padding(12)
-                .background(isSelected ? Color.accentColor.opacity(0.15) : Color.clear)
-                .clipShape(RoundedRectangle(cornerRadius: 12))
-            }
-            .buttonStyle(.plain)
-            Button(action: onChangePhoto) {
-                Image(systemName: "photo.badge.plus")
-                    .font(.body)
-                    .foregroundStyle(Color.accentColor)
-                    .padding(8)
-            }
-            .buttonStyle(.plain)
-        }
-    }
-}
+// CuadroRow → Extraído a UI/Components/CuadroRowView.swift

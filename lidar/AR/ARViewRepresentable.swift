@@ -28,24 +28,29 @@ struct ARViewRepresentable: UIViewControllerRepresentable {
 }
 
 final class ARViewController: UIViewController {
-    var sceneManager: ARSceneManager!
-    private var arView: ARSCNView!
+    var sceneManager: ARSceneManager?
+    private var arView: ARSCNView?
     private var currentScale: CGFloat = 1.0
     var arViewInteractionEnabled: Bool = true
     
     override func viewDidLoad() {
         super.viewDidLoad()
-        arView = ARSCNView(frame: view.bounds)
-        arView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
-        arView.autoenablesDefaultLighting = true
-        arView.debugOptions = []
-        view.addSubview(arView)
-        sceneManager.setSceneView(arView)
+        guard let sceneManager = sceneManager else { return }
+
+        let arSCNView = ARSCNView(frame: view.bounds)
+        arSCNView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        arSCNView.autoenablesDefaultLighting = true
+        arSCNView.debugOptions = []
+        view.addSubview(arSCNView)
+        self.arView = arSCNView
+
+        sceneManager.setSceneView(arSCNView)
         sceneManager.startSession()
+
         let longPress = UILongPressGestureRecognizer(target: self, action: #selector(handleLongPress(_:)))
         longPress.minimumPressDuration = 0.5
         longPress.delegate = self
-        arView.addGestureRecognizer(longPress)
+        arSCNView.addGestureRecognizer(longPress)
     }
 
     /// Aplica zoom visual por escala (1.0 = normal). Solo en modo medición se usa escala > 1.
@@ -58,69 +63,83 @@ final class ARViewController: UIViewController {
     }
 
     @objc private func handleLongPress(_ gesture: UILongPressGestureRecognizer) {
-        guard gesture.state == .began, let arView = arView else { return }
+        guard gesture.state == .began,
+              let arView = arView,
+              let sceneManager = sceneManager else { return }
         let location = gesture.location(in: arView)
         let hitResults = arView.hitTest(location, options: nil)
         guard let hit = hitResults.first else { return }
-        let node = hit.node
-        if let frameId = sceneManager.frameId(containing: node) {
+        if let frameId = sceneManager.frameId(containing: hit.node) {
             sceneManager.moveModeForFrameId = frameId
         }
     }
     
     override func viewWillDisappear(_ animated: Bool) {
         super.viewWillDisappear(animated)
-        sceneManager.pauseSession()
+        sceneManager?.pauseSession()
     }
     
     override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
-        guard arViewInteractionEnabled else { return }
-        guard let touch = touches.first, let arView = arView else { return }
+        guard arViewInteractionEnabled,
+              let touch = touches.first,
+              let arView = arView,
+              let sceneManager = sceneManager else { return }
         let originalLocation = touch.location(in: arView)
-        
-        // Ignorar toques en la zona de la UI (usar coordenadas originales para verificar)
-        // Top 120pt y bottom 400pt cuando panel expandido
-        if originalLocation.y < 120 || originalLocation.y > arView.bounds.height - 400 {
+
+        // Ignorar toques en zonas de UI (top bar y panel inferior)
+        if originalLocation.y < AppConstants.Layout.topBarExclusionZone
+            || originalLocation.y > arView.bounds.height - AppConstants.Layout.bottomPanelExclusionZone {
             return
         }
-        
-        // Ajustar coordenadas por el zoom/transform aplicado para hit testing
+
+        // Ajustar coordenadas por zoom/transform para hit testing
         var location = originalLocation
         if currentScale != 1.0 {
             let center = CGPoint(x: arView.bounds.midX, y: arView.bounds.midY)
             location.x = center.x + (originalLocation.x - center.x) / currentScale
             location.y = center.y + (originalLocation.y - center.y) / currentScale
         }
-        
+
         if sceneManager.isMeasurementMode {
-            let types: ARHitTestResult.ResultType = [.existingPlaneUsingGeometry, .existingPlaneUsingExtent, .featurePoint]
-            let results = arView.hitTest(location, types: types)
-            guard let hit = results.first else { return }
-            let position = hit.worldTransform.position
-            sceneManager.addMeasurementPoint(position)
-            
-            // Feedback háptico al colocar punto
-            let generator = UIImpactFeedbackGenerator(style: .medium)
-            generator.impactOccurred()
+            // Raycast: intentar planos existentes, luego planos estimados
+            if let result = performRaycast(from: location, arView: arView, allowEstimated: true) {
+                let position = result.worldTransform.position
+                sceneManager.addMeasurementPoint(position)
+                HapticService.shared.impact(style: .medium)
+            }
         } else {
-            let results = arView.hitTest(location, types: [.existingPlaneUsingGeometry, .existingPlaneUsingExtent])
-            guard let hit = results.first else { return }
-            let anchor = hit.anchor as? ARPlaneAnchor
-            let position = hit.worldTransform.position
-            if let moveId = sceneManager.moveModeForFrameId {
-                sceneManager.moveFrame(id: moveId, to: position, planeAnchor: anchor)
-                
-                // Feedback háptico al mover cuadro
-                let generator = UINotificationFeedbackGenerator()
-                generator.notificationOccurred(.success)
-            } else {
-                sceneManager.placeFrame(at: position, on: anchor)
-                
-                // Feedback háptico al colocar cuadro
-                let generator = UIImpactFeedbackGenerator(style: .light)
-                generator.impactOccurred()
+            // Raycast solo sobre planos existentes
+            if let result = performRaycast(from: location, arView: arView, allowEstimated: false) {
+                let anchor = result.anchor as? ARPlaneAnchor
+                let position = result.worldTransform.position
+                if let moveId = sceneManager.moveModeForFrameId {
+                    sceneManager.moveFrame(id: moveId, to: position, planeAnchor: anchor)
+                    HapticService.shared.notification(type: .success)
+                } else {
+                    sceneManager.placeFrame(at: position, on: anchor)
+                    HapticService.shared.impact(style: .light)
+                }
             }
         }
+    }
+
+    // MARK: - Raycast Helper
+
+    /// Realiza un raycast desde un punto de pantalla. Usa `ARSession.raycast` en lugar del deprecated `hitTest`.
+    private func performRaycast(from location: CGPoint, arView: ARSCNView, allowEstimated: Bool) -> ARRaycastResult? {
+        // Intentar planos existentes con geometría
+        if let query = arView.raycastQuery(from: location, allowing: .existingPlaneGeometry, alignment: .any) {
+            if let result = arView.session.raycast(query).first {
+                return result
+            }
+        }
+        // Fallback a planos estimados (para medición)
+        if allowEstimated {
+            if let query = arView.raycastQuery(from: location, allowing: .estimatedPlane, alignment: .any) {
+                return arView.session.raycast(query).first
+            }
+        }
+        return nil
     }
 }
 
@@ -128,16 +147,13 @@ final class ARViewController: UIViewController {
 
 extension ARViewController: UIGestureRecognizerDelegate {
     func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldReceive touch: UITouch) -> Bool {
-        // No procesar gestos si la interacción está deshabilitada
         guard arViewInteractionEnabled else { return false }
-        
         let location = touch.location(in: view)
-        
         // Ignorar toques en zonas de UI (top bar y panel inferior)
-        if location.y < 120 || location.y > view.bounds.height - 400 {
+        if location.y < AppConstants.Layout.topBarExclusionZone
+            || location.y > view.bounds.height - AppConstants.Layout.bottomPanelExclusionZone {
             return false
         }
-        
         return true
     }
 }

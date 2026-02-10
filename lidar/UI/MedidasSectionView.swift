@@ -78,7 +78,7 @@ struct MedidasSectionView: View {
                 Slider(value: Binding(
                     get: { Double(sceneManager.measurementZoomScale) },
                     set: { sceneManager.measurementZoomScale = Float($0) }
-                ), in: 1.0...2.5, step: 0.1)
+                ), in: AppConstants.Measurement.zoomRange, step: AppConstants.Measurement.zoomStep)
                 .accessibilityLabel("Zoom de medición")
                 .accessibilityValue(String(format: "%.1f aumentos", sceneManager.measurementZoomScale))
                 .accessibilityHint("Ajusta el zoom de la vista AR para mayor precisión al medir")
@@ -88,9 +88,7 @@ struct MedidasSectionView: View {
             .clipShape(RoundedRectangle(cornerRadius: 10))
             Button("Cancelar medición") {
                 sceneManager.cancelMeasurement()
-                // Feedback háptico
-                let generator = UINotificationFeedbackGenerator()
-                generator.notificationOccurred(.warning)
+                HapticService.shared.notification(type: .warning)
             }
             .font(.subheadline)
             .foregroundStyle(.red)
@@ -104,9 +102,7 @@ struct MedidasSectionView: View {
     private var startMeasurementButton: some View {
         Button {
             sceneManager.startMeasurement()
-            // Feedback háptico
-            let generator = UIImpactFeedbackGenerator(style: .medium)
-            generator.impactOccurred()
+            HapticService.shared.impact(style: .medium)
         } label: {
             Label("Medir distancia", systemImage: "ruler")
                 .font(.headline)
@@ -156,7 +152,7 @@ struct MedidasSectionView: View {
                     .clipShape(Capsule())
             }
             ForEach(Array(sceneManager.measurements.enumerated()), id: \.element.id) { index, m in
-                MeasurementRow(
+                MeasurementRowView(
                     index: index + 1,
                     measurement: m,
                     unit: sceneManager.measurementUnit,
@@ -166,9 +162,7 @@ struct MedidasSectionView: View {
             if sceneManager.measurements.count > 1 {
                 Button(role: .destructive) {
                     sceneManager.deleteAllMeasurements()
-                    // Feedback háptico
-                    let generator = UINotificationFeedbackGenerator()
-                    generator.notificationOccurred(.warning)
+                    HapticService.shared.notification(type: .warning)
                 } label: {
                     Label("Borrar todas las mediciones", systemImage: "trash")
                         .font(.subheadline)
@@ -199,47 +193,5 @@ struct MedidasSectionView: View {
                 .glassBackground(cornerRadius: 16)
             }
         }
-    }
-}
-
-private struct MeasurementRow: View {
-    let index: Int
-    let measurement: Measurement
-    let unit: MeasurementUnit
-    let onDelete: () -> Void
-
-    var body: some View {
-        HStack(spacing: 12) {
-            Text("\(index)")
-                .font(.caption)
-                .fontWeight(.semibold)
-                .foregroundStyle(.secondary)
-                .frame(width: 24, height: 24)
-                .background(Color.secondary.opacity(0.2))
-                .clipShape(Circle())
-            VStack(alignment: .leading, spacing: 2) {
-                Text(unit.format(distanceMeters: measurement.distance))
-                    .font(.subheadline)
-                    .fontWeight(.medium)
-                Text("Punto A → Punto B")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-            }
-            Spacer(minLength: 0)
-            Button(role: .destructive) {
-                onDelete()
-                // Feedback háptico
-                let generator = UIImpactFeedbackGenerator(style: .light)
-                generator.impactOccurred()
-            } label: {
-                Image(systemName: "trash")
-                    .font(.body)
-            }
-            .buttonStyle(.borderless)
-            .accessibilityLabel("Eliminar medición \(index)")
-        }
-        .padding(10)
-        .background(Color.primary.opacity(0.05))
-        .clipShape(RoundedRectangle(cornerRadius: 10))
     }
 }
