@@ -348,12 +348,21 @@ final class ARSceneManager: NSObject {
         }
     }
 
-    /// Captura la vista AR actual y todas las mediciones con posiciones 2D normalizadas.
+    /// Captura la vista AR actual con todas las mediciones y cuadros con posiciones 2D normalizadas.
     /// Usa `StorageService` para persistir imagen + JSON en Documents/OffsiteCaptures/.
     /// - Returns: (URL de la imagen, URL del JSON) o lanza error si falla.
     func captureForOffsite() throws -> (imageURL: URL, jsonURL: URL) {
         guard let sceneView = sceneView else { throw CaptureError.noSceneView }
-        let image = sceneView.snapshot()
+        
+        // Capturar con alta resolución (escala 2x en dispositivos retina)
+        UIGraphicsBeginImageContextWithOptions(sceneView.bounds.size, false, UIScreen.main.scale)
+        defer { UIGraphicsEndImageContext() }
+        
+        sceneView.drawHierarchy(in: sceneView.bounds, afterScreenUpdates: true)
+        guard let image = UIGraphicsGetImageFromCurrentImageContext() else {
+            throw CaptureError.imageEncodingFailed
+        }
+        
         let w = sceneView.bounds.width
         let h = sceneView.bounds.height
         guard w > 0, h > 0 else { throw CaptureError.invalidBounds }
@@ -366,7 +375,49 @@ final class ARSceneManager: NSObject {
             let pointB = NormalizedPoint(x: Double(pb.x) / Double(w), y: Double(pb.y) / Double(h))
             return OffsiteMeasurement(id: m.id, distanceMeters: Double(m.distance), pointA: pointA, pointB: pointB, isFromAR: true)
         }
-        let captureData = OffsiteCaptureData(capturedAt: Date(), measurements: offsiteMeasurements, frames: [], textAnnotations: [])
+        
+        // Proyectar cuadros 3D a coordenadas 2D normalizadas
+        let offsiteFrames: [OffsiteFrame] = placedFrames.compactMap { frame in
+            // Proyectar el centro del cuadro
+            let frameNode = frame.node
+            let framePosition = frameNode.simdWorldPosition
+            let projected = sceneView.projectPoint(SCNVector3(framePosition))
+            
+            // Calcular las dimensiones del cuadro proyectadas
+            let frameWidth = frame.size.width
+            let frameHeight = frame.size.height
+            
+            // Proyectar las esquinas del cuadro para obtener dimensiones en 2D
+            let halfW = Float(frameWidth) / 2.0
+            let halfH = Float(frameHeight) / 2.0
+            
+            let topLeft3D = framePosition + simd_make_float3(-halfW, halfH, 0)
+            let bottomRight3D = framePosition + simd_make_float3(halfW, -halfH, 0)
+            
+            let projTL = sceneView.projectPoint(SCNVector3(topLeft3D))
+            let projBR = sceneView.projectPoint(SCNVector3(bottomRight3D))
+            
+            let topLeftNorm = NormalizedPoint(x: Double(projTL.x) / Double(w), y: Double(projTL.y) / Double(h))
+            let widthNorm = Double(abs(projBR.x - projTL.x)) / Double(w)
+            let heightNorm = Double(abs(projBR.y - projTL.y)) / Double(h)
+            
+            // Solo incluir si está visible en pantalla
+            guard topLeftNorm.isValid || (topLeftNorm.x >= -0.1 && topLeftNorm.x <= 1.1 && topLeftNorm.y >= -0.1 && topLeftNorm.y <= 1.1) else {
+                logger.warning("Cuadro fuera de vista, omitiendo")
+                return nil
+            }
+            
+            return OffsiteFrame(
+                id: frame.id,
+                topLeft: topLeftNorm,
+                width: widthNorm,
+                height: heightNorm,
+                label: nil,
+                color: "#3B82F6"
+            )
+        }
+        
+        let captureData = OffsiteCaptureData(capturedAt: Date(), measurements: offsiteMeasurements, frames: offsiteFrames, textAnnotations: [])
 
         // Delegar persistencia al StorageService
         do {

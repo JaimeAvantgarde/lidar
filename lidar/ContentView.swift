@@ -72,7 +72,7 @@ struct ContentView: View {
         .sheet(isPresented: $showPlaneInfo) {
             planeInfoSheet
         }
-        .sheet(isPresented: $showOffsiteSheet) {
+        .fullScreenCover(isPresented: $showOffsiteSheet) {
             OffsiteCapturesListView()
         }
         .alert("Offsite", isPresented: Binding(
@@ -130,7 +130,11 @@ struct ContentView: View {
                 do {
                     _ = try sceneManager.captureForOffsite()
                     HapticService.shared.notification(type: .success)
-                    offsiteCaptureAlert = "✓ Captura guardada con \(sceneManager.measurements.count) medición\(sceneManager.measurements.count == 1 ? "" : "es"). Puedes verla en «Ver capturas»."
+                    let measurementCount = sceneManager.measurements.count
+                    let frameCount = sceneManager.placedFrames.count
+                    let measurementText = measurementCount == 1 ? "1 medición" : "\(measurementCount) mediciones"
+                    let frameText = frameCount == 1 ? "1 cuadro" : "\(frameCount) cuadros"
+                    offsiteCaptureAlert = "✓ Captura guardada con \(measurementText)\(frameCount > 0 ? " y \(frameText)" : ""). Puedes verla en «Ver capturas»."
                 } catch ARSceneManager.CaptureError.noSceneView {
                     HapticService.shared.notification(type: .error)
                     offsiteCaptureAlert = "Error: Vista AR no disponible"

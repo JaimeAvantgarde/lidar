@@ -38,6 +38,22 @@ struct OffsiteCapturesListView: View {
                                         Text(entry.capturedAt, style: .time)
                                             .font(.caption)
                                             .foregroundStyle(.secondary)
+                                        
+                                        // Mostrar información de contenido
+                                        if let dataURL = entry.jsonURL.path as? String,
+                                           let captureData = loadCaptureDataPreview(from: entry.jsonURL) {
+                                            HStack(spacing: 8) {
+                                                if captureData.measurements.count > 0 {
+                                                    Label("\(captureData.measurements.count)", systemImage: "ruler")
+                                                        .font(.caption2)
+                                                }
+                                                if captureData.frames.count > 0 {
+                                                    Label("\(captureData.frames.count)", systemImage: "photo.artframe")
+                                                        .font(.caption2)
+                                                }
+                                            }
+                                            .foregroundStyle(.secondary)
+                                        }
                                     }
                                     Spacer(minLength: 0)
                                 }
@@ -49,7 +65,7 @@ struct OffsiteCapturesListView: View {
                 }
             }
             .navigationTitle("Capturas offsite")
-            .navigationBarTitleDisplayMode(.inline)
+            .navigationBarTitleDisplayMode(.large)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Cerrar") { dismiss() }
@@ -65,6 +81,13 @@ struct OffsiteCapturesListView: View {
                 OffsiteCaptureDetailView(entry: entry)
             }
         }
+    }
+    
+    private func loadCaptureDataPreview(from url: URL) -> OffsiteCaptureData? {
+        guard let data = try? Data(contentsOf: url) else { return nil }
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        return try? decoder.decode(OffsiteCaptureData.self, from: data)
     }
 
     private func thumbnail(for entry: OffsiteCaptureEntry) -> some View {
@@ -222,6 +245,12 @@ struct OffsiteCaptureDetailView: View {
             .onAppear {
                 image = UIImage(contentsOfFile: entry.imageURL.path)
                 loadData()
+            }
+            .onChange(of: data) { _, newData in
+                // Debug: Verificar que los datos se cargaron correctamente
+                if let newData = newData {
+                    print("📊 Captura cargada: \(newData.measurements.count) mediciones, \(newData.frames.count) cuadros")
+                }
             }
     }
     
