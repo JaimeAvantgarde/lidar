@@ -60,9 +60,9 @@ struct OffsiteMeasurement: Codable, Identifiable, Hashable {
 /// Rectángulo/cuadro anotado sobre la imagen offsite.
 struct OffsiteFrame: Codable, Identifiable, Hashable {
     var id: UUID
-    let topLeft: NormalizedPoint
-    let width: Double  // Normalizado 0-1 (posición en imagen)
-    let height: Double // Normalizado 0-1 (posición en imagen)
+    var topLeft: NormalizedPoint
+    var width: Double  // Normalizado 0-1 (posición en imagen)
+    var height: Double // Normalizado 0-1 (posición en imagen)
     var label: String?
     var color: String  // Hex color (#RRGGBB)
     
@@ -101,13 +101,19 @@ struct OffsiteTextAnnotation: Codable, Identifiable, Hashable {
     }
 }
 
+/// Dimensiones de un plano detectado por LiDAR
+struct PlaneDimension: Codable, Equatable, Hashable {
+    let width: Double
+    let height: Double
+}
+
 /// Metadata del LiDAR capturado (dimensiones de planos detectados)
 struct OffsiteLiDARMetadata: Codable, Equatable, Hashable {
     let isLiDARAvailable: Bool
     let planeCount: Int
-    let planeDimensions: [(width: Double, height: Double)]  // En metros
+    let planeDimensions: [PlaneDimension]  // En metros
     
-    init(isLiDARAvailable: Bool, planeCount: Int, planeDimensions: [(width: Double, height: Double)]) {
+    init(isLiDARAvailable: Bool, planeCount: Int, planeDimensions: [PlaneDimension]) {
         self.isLiDARAvailable = isLiDARAvailable
         self.planeCount = planeCount
         self.planeDimensions = planeDimensions
@@ -123,8 +129,10 @@ struct OffsiteCaptureData: Codable, Equatable {
     var lastModified: Date?
     var lidarMetadata: OffsiteLiDARMetadata?  // Metadata del LiDAR
     var imageScale: Double  // Escala de la imagen capturada
+    /// Snapshot completo de la escena 3D (planos, esquinas, cámara, cuadros con perspectiva)
+    var sceneSnapshot: OffsiteSceneSnapshot?
 
-    init(capturedAt: Date = Date(), measurements: [OffsiteMeasurement], frames: [OffsiteFrame] = [], textAnnotations: [OffsiteTextAnnotation] = [], lastModified: Date? = nil, lidarMetadata: OffsiteLiDARMetadata? = nil, imageScale: Double = 1.0) {
+    init(capturedAt: Date = Date(), measurements: [OffsiteMeasurement], frames: [OffsiteFrame] = [], textAnnotations: [OffsiteTextAnnotation] = [], lastModified: Date? = nil, lidarMetadata: OffsiteLiDARMetadata? = nil, imageScale: Double = 1.0, sceneSnapshot: OffsiteSceneSnapshot? = nil) {
         self.capturedAt = capturedAt
         self.measurements = measurements
         self.frames = frames
@@ -132,5 +140,31 @@ struct OffsiteCaptureData: Codable, Equatable {
         self.lastModified = lastModified
         self.lidarMetadata = lidarMetadata
         self.imageScale = imageScale
+        self.sceneSnapshot = sceneSnapshot
+    }
+    
+    /// Acceso rápido a planos del snapshot
+    var detectedPlanes: [OffsitePlaneData] {
+        sceneSnapshot?.planes ?? []
+    }
+    
+    /// Acceso rápido a esquinas del snapshot
+    var detectedCorners: [OffsiteCornerData] {
+        sceneSnapshot?.corners ?? []
+    }
+    
+    /// Acceso rápido a paredes
+    var detectedWalls: [OffsitePlaneData] {
+        sceneSnapshot?.walls ?? []
+    }
+    
+    /// Acceso rápido a cuadros con perspectiva
+    var perspectiveFrames: [OffsiteFramePerspective] {
+        sceneSnapshot?.perspectiveFrames ?? []
+    }
+    
+    /// Escala metros/pixel
+    var metersPerPixelScale: Double? {
+        sceneSnapshot?.metersPerPixelScale
     }
 }

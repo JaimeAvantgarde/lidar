@@ -106,6 +106,27 @@ struct ContentView: View {
             }
             .glassPill()
 
+            // Planos y esquinas detectados
+            if !sceneManager.detectedPlaneAnchors.isEmpty {
+                HStack(spacing: 6) {
+                    Image(systemName: "square.3.layers.3d")
+                        .font(.caption2)
+                    Text("\(sceneManager.detectedPlaneAnchors.count)")
+                        .font(.caption)
+                        .fontWeight(.medium)
+                    if !sceneManager.detectedCorners.isEmpty {
+                        Text("·")
+                            .font(.caption2)
+                        Image(systemName: "point.topleft.down.to.point.bottomright.curvepath")
+                            .font(.caption2)
+                        Text("\(sceneManager.detectedCorners.count)")
+                            .font(.caption)
+                            .fontWeight(.medium)
+                    }
+                }
+                .glassPill()
+            }
+
             // Dimensiones del plano
             if let dims = sceneManager.lastPlaneDimensions {
                 Button {
@@ -132,9 +153,23 @@ struct ContentView: View {
                     HapticService.shared.notification(type: .success)
                     let measurementCount = sceneManager.measurements.count
                     let frameCount = sceneManager.placedFrames.count
-                    let measurementText = measurementCount == 1 ? "1 medición" : "\(measurementCount) mediciones"
-                    let frameText = frameCount == 1 ? "1 cuadro" : "\(frameCount) cuadros"
-                    offsiteCaptureAlert = "✓ Captura guardada con \(measurementText)\(frameCount > 0 ? " y \(frameText)" : ""). Puedes verla en «Ver capturas»."
+                    let planeCount = sceneManager.detectedPlaneAnchors.count
+                    let cornerCount = sceneManager.detectedCorners.count
+                    var parts: [String] = []
+                    if measurementCount > 0 {
+                        parts.append(measurementCount == 1 ? "1 medición" : "\(measurementCount) mediciones")
+                    }
+                    if frameCount > 0 {
+                        parts.append(frameCount == 1 ? "1 cuadro" : "\(frameCount) cuadros")
+                    }
+                    if planeCount > 0 {
+                        parts.append(planeCount == 1 ? "1 plano" : "\(planeCount) planos")
+                    }
+                    if cornerCount > 0 {
+                        parts.append(cornerCount == 1 ? "1 esquina" : "\(cornerCount) esquinas")
+                    }
+                    let summary = parts.isEmpty ? "datos de escena" : parts.joined(separator: ", ")
+                    offsiteCaptureAlert = "✓ Captura guardada con \(summary). Puedes verla en «Ver capturas»."
                 } catch ARSceneManager.CaptureError.noSceneView {
                     HapticService.shared.notification(type: .error)
                     offsiteCaptureAlert = "Error: Vista AR no disponible"
@@ -149,14 +184,21 @@ struct ContentView: View {
                     offsiteCaptureAlert = "Error al guardar: \(error.localizedDescription)"
                 }
             } label: {
-                Image(systemName: "camera.viewfinder")
-                    .font(.subheadline)
-                    .glassPill()
+                HStack(spacing: 4) {
+                    Image(systemName: "camera.viewfinder")
+                        .font(.subheadline)
+                    if captureDataCount > 0 {
+                        Text("\(captureDataCount)")
+                            .font(.caption2)
+                            .fontWeight(.bold)
+                    }
+                }
+                .glassPill()
             }
-            .disabled(sceneManager.measurements.isEmpty)
-            .opacity(sceneManager.measurements.isEmpty ? 0.5 : 1.0)
+            .disabled(!canCapture)
+            .opacity(canCapture ? 1.0 : 0.5)
             .accessibilityLabel("Capturar para offsite")
-            .accessibilityHint(sceneManager.measurements.isEmpty ? "Necesitas al menos una medición para capturar" : "Guarda una foto con las \(sceneManager.measurements.count) medición\(sceneManager.measurements.count == 1 ? "" : "es") actuales")
+            .accessibilityHint(canCapture ? "Guarda la escena actual con \(captureDataCount) elementos" : "Necesitas al menos una medición o plano detectado para capturar")
             .buttonStyle(.plain)
 
             // Ver capturas offsite
@@ -253,8 +295,49 @@ struct ContentView: View {
                                     .font(.title)
                                     .fontWeight(.bold)
                             }
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text("Área")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                Text(String(format: "%.2f m²", dims.width * dims.height))
+                                    .font(.title)
+                                    .fontWeight(.bold)
+                            }
                         }
-                        Text("LiDAR: \(sceneManager.isLiDARAvailable ? "Disponible" : "No disponible")")
+
+                        Divider()
+
+                        // Resumen escena
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("Escena detectada")
+                                .font(.headline)
+                            HStack(spacing: 20) {
+                                Label("\(sceneManager.detectedPlaneAnchors.count) planos", systemImage: "square.3.layers.3d")
+                                Label("\(sceneManager.detectedCorners.count) esquinas", systemImage: "point.topleft.down.to.point.bottomright.curvepath")
+                            }
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+
+                            HStack(spacing: 20) {
+                                Label("\(sceneManager.measurements.count) mediciones", systemImage: "ruler")
+                                Label("\(sceneManager.placedFrames.count) cuadros", systemImage: "photo.artframe")
+                            }
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                        }
+
+                        // Toggles rápidos
+                        Divider()
+                        VStack(alignment: .leading, spacing: 12) {
+                            Text("Visualización")
+                                .font(.headline)
+                            Toggle("Contornos de planos", isOn: $sceneManager.showPlaneOverlays)
+                            Toggle("Marcadores de esquinas", isOn: $sceneManager.showCornerMarkers)
+                            Toggle("Snap a bordes/esquinas", isOn: $sceneManager.snapToEdgesEnabled)
+                            Toggle("Perspectiva en cuadros", isOn: $sceneManager.useFramePerspective)
+                        }
+
+                        Text("LiDAR: \(sceneManager.isLiDARAvailable ? "Disponible ✓" : "No disponible ✗")")
                             .font(.subheadline)
                             .foregroundStyle(.secondary)
                         Spacer()
@@ -292,6 +375,11 @@ struct ContentView: View {
 
     private var hintText: String {
         if sceneManager.isMeasurementMode {
+            if sceneManager.lastSnapPoint != nil {
+                return sceneManager.measurementFirstPoint == nil
+                    ? "⊕ Snap detectado · Toca para fijar punto 1"
+                    : "⊕ Snap detectado · Toca para fijar punto 2"
+            }
             return sceneManager.measurementFirstPoint == nil
                 ? "Toca el primer punto para medir"
                 : "Toca el segundo punto para medir"
@@ -299,7 +387,20 @@ struct ContentView: View {
         if sceneManager.moveModeForFrameId != nil {
             return "Toca un plano para colocar el cuadro aquí"
         }
+        if sceneManager.useFramePerspective {
+            return "Toca una pared para colocar con perspectiva"
+        }
         return "Toca un plano para colocar un cuadro"
+    }
+
+    // MARK: - Computed helpers
+
+    private var canCapture: Bool {
+        !sceneManager.measurements.isEmpty || !sceneManager.detectedPlaneAnchors.isEmpty || !sceneManager.placedFrames.isEmpty
+    }
+
+    private var captureDataCount: Int {
+        sceneManager.measurements.count + sceneManager.placedFrames.count + sceneManager.detectedPlaneAnchors.count
     }
 
     // MARK: - Banner de error

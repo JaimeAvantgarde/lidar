@@ -133,9 +133,16 @@ struct OffsiteCaptureDetailView: View {
     @State private var selectedFrameId: UUID?  // Cuadro seleccionado para editar
     @State private var showImagePicker = false  // Para cambiar imagen de cuadro
     @State private var selectedImage: UIImage?  // Imagen seleccionada de galería
+    // MARK: - Scene overlay state
+    @State private var showPlaneOverlays: Bool = true
+    @State private var showCornerMarkers: Bool = true
+    @State private var showWallDimensions: Bool = true
+    @State private var showPerspectiveFrames: Bool = true
+    @State private var selectedPlaneId: String?
+    @State private var overlayOpacity: Double = 1.0
     
     enum EditTool {
-        case none, measure, frame, text
+        case none, measure, frame, text, placeFrame
     }
 
     var body: some View {
@@ -222,26 +229,32 @@ struct OffsiteCaptureDetailView: View {
             }
         }
             .overlay(alignment: .topLeading) {
-                // Información del LiDAR capturado
-                if !isEditMode, let metadata = data?.lidarMetadata {
-                    VStack(alignment: .leading, spacing: 4) {
-                        HStack(spacing: 6) {
-                            Image(systemName: metadata.isLiDARAvailable ? "sensor.fill" : "sensor")
-                                .font(.caption)
-                                .foregroundStyle(metadata.isLiDARAvailable ? .green : .secondary)
-                            Text(metadata.isLiDARAvailable ? "LiDAR" : "AR")
-                                .font(.caption2)
-                                .fontWeight(.medium)
-                        }
-                        if metadata.planeCount > 0 {
-                            Text("\(metadata.planeCount) planos detectados")
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
+                // Información completa de la escena capturada
+                if !isEditMode {
+                    VStack(alignment: .leading, spacing: 8) {
+                        if let snapshot = data?.sceneSnapshot {
+                            OffsiteSceneInfoPanel(snapshot: snapshot)
+                        } else if let metadata = data?.lidarMetadata {
+                            VStack(alignment: .leading, spacing: 4) {
+                                HStack(spacing: 6) {
+                                    Image(systemName: metadata.isLiDARAvailable ? "sensor.fill" : "sensor")
+                                        .font(.caption)
+                                        .foregroundStyle(metadata.isLiDARAvailable ? .green : .secondary)
+                                    Text(metadata.isLiDARAvailable ? "LiDAR" : "AR")
+                                        .font(.caption2)
+                                        .fontWeight(.medium)
+                                }
+                                if metadata.planeCount > 0 {
+                                    Text("\(metadata.planeCount) planos detectados")
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 8)
+                            .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12))
                         }
                     }
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 8)
-                    .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12))
                     .padding(.top, 60)
                     .padding(.leading, 16)
                 }
@@ -343,6 +356,7 @@ struct OffsiteCaptureDetailView: View {
         switch editTool {
         case .measure: return pendingMeasurementPoint == nil ? "1.circle.fill" : "2.circle.fill"
         case .frame: return "rectangle.dashed"
+        case .placeFrame: return "photo.artframe"
         case .text: return "text.bubble.fill"
         case .none: return ""
         }
@@ -354,6 +368,8 @@ struct OffsiteCaptureDetailView: View {
             return pendingMeasurementPoint == nil ? "Toca el primer punto" : "Toca el segundo punto"
         case .frame:
             return "Toca para colocar cuadro"
+        case .placeFrame:
+            return selectedPlaneId != nil ? "Toca en la pared para colocar" : "Selecciona una pared y toca para colocar"
         case .text:
             return "Toca para añadir texto"
         case .none:
@@ -364,11 +380,20 @@ struct OffsiteCaptureDetailView: View {
     // MARK: - Edit Toolbar
     
     private var editToolbar: some View {
-        VStack(spacing: 16) {
+        VStack(spacing: 12) {
+            // Overlay toggles
+            HStack(spacing: 12) {
+                OverlayToggle(icon: "rectangle.dashed", label: "Planos", isOn: $showPlaneOverlays, color: .blue)
+                OverlayToggle(icon: "angle", label: "Esquinas", isOn: $showCornerMarkers, color: .yellow)
+                OverlayToggle(icon: "ruler", label: "Cotas", isOn: $showWallDimensions, color: .orange)
+                OverlayToggle(icon: "cube", label: "Cuadros 3D", isOn: $showPerspectiveFrames, color: .purple)
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 8)
+            .background(Color.black.opacity(0.5), in: Capsule())
+            
             // Leyenda de colores
-            if !isEditMode {
-                EmptyView()
-            } else {
+            if isEditMode {
                 HStack(spacing: 20) {
                     Label("AR precisa", systemImage: "checkmark.seal.fill")
                         .font(.caption2)
@@ -385,9 +410,10 @@ struct OffsiteCaptureDetailView: View {
             HStack(spacing: 16) {
                 ForEach([
                     (EditTool.measure, "ruler", "Medir", Color.green),
+                    (EditTool.placeFrame, "photo.artframe", "En pared", Color.purple),
                     (EditTool.frame, "rectangle.dashed", "Cuadro", Color.blue),
                     (EditTool.text, "text.bubble", "Texto", Color.purple)
-                ], id: \.0) { tool, icon, label, color in
+                ], id: \.1) { tool, icon, label, color in
                     Button {
                         withAnimation(.spring(response: 0.3)) {
                             editTool = editTool == tool ? .none : tool
@@ -439,18 +465,99 @@ struct OffsiteCaptureDetailView: View {
         let scale = scaleToFit(imageSize: imageSize, in: viewSize)
         let offset = offsetToCenter(imageSize: imageSize, in: viewSize, scale: scale)
         
-        ForEach(data.measurements) { m in
-            measurementOverlay(m, scale: scale, offset: offset, imageSize: imageSize)
+        // === Plane overlays (from scene snapshot) ===
+        if showPlaneOverlays, let snapshot = data.sceneSnapshot {
+            ForEach(snapshot.planes) { plane in
+                PlaneOverlayView(
+                    plane: plane,
+                    isSelected: selectedPlaneId == plane.id,
+                    imageSize: imageSize,
+                    scale: scale,
+                    offset: offset,
+                    showDimensions: true,
+                    onTap: {
+                        selectedPlaneId = selectedPlaneId == plane.id ? nil : plane.id
+                        HapticService.shared.impact(style: .light)
+                    }
+                )
+                .opacity(overlayOpacity)
+            }
         }
         
+        // === Wall dimensions ===
+        if showWallDimensions, let snapshot = data.sceneSnapshot {
+            ForEach(snapshot.wallDimensions) { wall in
+                WallDimensionOverlayView(
+                    wall: wall,
+                    imageSize: imageSize,
+                    scale: scale,
+                    offset: offset,
+                    unit: unit
+                )
+                .opacity(overlayOpacity)
+            }
+        }
+        
+        // === Corner markers ===
+        if showCornerMarkers, let snapshot = data.sceneSnapshot {
+            ForEach(snapshot.corners) { corner in
+                CornerOverlayView(
+                    corner: corner,
+                    imageSize: imageSize,
+                    scale: scale,
+                    offset: offset
+                )
+                .opacity(overlayOpacity)
+            }
+        }
+        
+        // === Perspective frames (from scene snapshot) ===
+        if showPerspectiveFrames, let snapshot = data.sceneSnapshot {
+            ForEach(snapshot.perspectiveFrames) { frame in
+                PerspectiveFrameOverlayView(
+                    frame: frame,
+                    imageSize: imageSize,
+                    scale: scale,
+                    offset: offset,
+                    isSelected: selectedFrameId == frame.id,
+                    isEditMode: isEditMode,
+                    onSelect: {
+                        if isEditMode {
+                            selectedFrameId = selectedFrameId == frame.id ? nil : frame.id
+                            HapticService.shared.impact(style: .medium)
+                        }
+                    },
+                    onDelete: {
+                        deletePerspectiveFrame(id: frame.id)
+                    }
+                )
+            }
+        }
+        
+        // === Standard measurements ===
+        ForEach(data.measurements) { m in
+            EnhancedMeasurementOverlay(
+                measurement: m,
+                imageSize: imageSize,
+                scale: scale,
+                offset: offset,
+                unit: unit,
+                isEditMode: isEditMode,
+                onDelete: { deleteMeasurement(id: m.id) }
+            )
+        }
+        
+        // === Standard frames (non-perspective) ===
         ForEach(data.frames) { frame in
             frameOverlay(frame, scale: scale, offset: offset, imageSize: imageSize)
         }
         
+        // === Text annotations ===
         ForEach(data.textAnnotations) { annotation in
             textAnnotationOverlay(annotation, scale: scale, offset: offset, imageSize: imageSize)
         }
         
+        // === Pending measurement point ===
         if let point = pendingMeasurementPoint {
             ZStack {
                 Circle()
@@ -643,14 +750,6 @@ struct OffsiteCaptureDetailView: View {
                 HapticService.shared.impact(style: .medium)
             }
         }
-                } label: {
-                    Image(systemName: "xmark.circle.fill")
-                        .foregroundStyle(.red)
-                        .background(Circle().fill(.white))
-                }
-                .position(x: x + w - 8, y: y + 8)
-            }
-        }
     }
     
     @ViewBuilder
@@ -704,6 +803,8 @@ struct OffsiteCaptureDetailView: View {
             handleMeasureTap(point: normalizedPoint, screenPoint: location, viewSize: viewSize, imageSize: imageSize)
         case .frame:
             handleFrameTap(point: normalizedPoint)
+        case .placeFrame:
+            handlePlaceFrameOnWall(point: normalizedPoint, viewSize: viewSize, imageSize: imageSize)
         case .text:
             handleTextTap(point: normalizedPoint, screenPoint: location, viewSize: viewSize, imageSize: imageSize)
         case .none:
@@ -851,6 +952,178 @@ struct OffsiteCaptureDetailView: View {
     
     // MARK: - Frame Edit Actions
     
+    /// Coloca un cuadro dentro de una pared detectada con perspectiva.
+    private func handlePlaceFrameOnWall(point: NormalizedPoint, viewSize: CGSize, imageSize: CGSize) {
+        guard var currentData = data, let snapshot = currentData.sceneSnapshot else {
+            // Fallback to regular frame if no snapshot
+            handleFrameTap(point: point)
+            return
+        }
+        
+        // Encontrar el plano que contiene este punto
+        let targetPlane = findPlaneContaining(point: point, in: snapshot)
+        
+        // Calcular dimensiones del cuadro basadas en la escala real
+        let frameWidthMeters: Double
+        let frameHeightMeters: Double
+        
+        if let plane = targetPlane {
+            // Usar 20% del ancho del plano
+            frameWidthMeters = plane.widthMeters * 0.2
+            frameHeightMeters = frameWidthMeters * 1.3 // Proporción cuadro
+        } else if let scale = snapshot.metersPerPixelScale {
+            frameWidthMeters = scale * 0.15 * Double(imageSize.width)
+            frameHeightMeters = frameWidthMeters * 1.3
+        } else {
+            frameWidthMeters = 0.5
+            frameHeightMeters = 0.65
+        }
+        
+        // Calcular las 4 esquinas con perspectiva del plano
+        let halfW = 0.075 // 7.5% normalizado
+        let halfH = halfW * 1.3
+        
+        let corners: [[Double]]
+        if let plane = targetPlane, plane.projectedVertices.count >= 4 {
+            // Calcular perspectiva real basada en el plano
+            let planeCorners = plane.projectedVertices
+            corners = calculatePerspectiveCorners(
+                center: point,
+                halfW: halfW,
+                halfH: halfH,
+                planeVertices: planeCorners
+            )
+        } else {
+            // Sin perspectiva - esquinas rectangulares
+            corners = [
+                [point.x - halfW, point.y - halfH],
+                [point.x + halfW, point.y - halfH],
+                [point.x + halfW, point.y + halfH],
+                [point.x - halfW, point.y + halfH]
+            ]
+        }
+        
+        let newFrame = OffsiteFramePerspective(
+            planeId: targetPlane?.id,
+            center2D: point,
+            corners2D: corners,
+            widthMeters: frameWidthMeters,
+            heightMeters: frameHeightMeters,
+            label: "Cuadro \((snapshot.perspectiveFrames.count) + 1)",
+            color: AppConstants.OffsiteEditor.availableColors.randomElement() ?? "#3B82F6"
+        )
+        
+        var updatedSnapshot = snapshot
+        updatedSnapshot.perspectiveFrames.append(newFrame)
+        currentData.sceneSnapshot = updatedSnapshot
+        data = currentData
+        
+        HapticService.shared.notification(type: .success)
+    }
+    
+    /// Encuentra el plano que contiene un punto normalizado.
+    private func findPlaneContaining(point: NormalizedPoint, in snapshot: OffsiteSceneSnapshot) -> OffsitePlaneData? {
+        for plane in snapshot.planes {
+            if isPointInPolygon(point: point, vertices: plane.projectedVertices) {
+                return plane
+            }
+        }
+        // Si hay plano seleccionado, usarlo
+        if let selectedId = selectedPlaneId {
+            return snapshot.planes.first { $0.id == selectedId }
+        }
+        return nil
+    }
+    
+    /// Verifica si un punto está dentro de un polígono (ray casting).
+    private func isPointInPolygon(point: NormalizedPoint, vertices: [[Double]]) -> Bool {
+        guard vertices.count >= 3 else { return false }
+        var inside = false
+        var j = vertices.count - 1
+        
+        for i in 0..<vertices.count {
+            guard vertices[i].count >= 2, vertices[j].count >= 2 else { j = i; continue }
+            let xi = vertices[i][0], yi = vertices[i][1]
+            let xj = vertices[j][0], yj = vertices[j][1]
+            
+            if ((yi > point.y) != (yj > point.y)) && (point.x < (xj - xi) * (point.y - yi) / (yj - yi) + xi) {
+                inside.toggle()
+            }
+            j = i
+        }
+        return inside
+    }
+    
+    /// Calcula esquinas con perspectiva basadas en las esquinas del plano.
+    private func calculatePerspectiveCorners(center: NormalizedPoint, halfW: Double, halfH: Double, planeVertices: [[Double]]) -> [[Double]] {
+        guard planeVertices.count >= 4 else {
+            return [
+                [center.x - halfW, center.y - halfH],
+                [center.x + halfW, center.y - halfH],
+                [center.x + halfW, center.y + halfH],
+                [center.x - halfW, center.y + halfH]
+            ]
+        }
+        
+        // Interpolar la perspectiva del plano
+        // Los vértices del plano definen la distorsión perspectiva
+        let pTL = planeVertices[0], pTR = planeVertices[1]
+        let pBR = planeVertices[2], pBL = planeVertices[3]
+        
+        guard pTL.count >= 2, pTR.count >= 2, pBR.count >= 2, pBL.count >= 2 else {
+            return [
+                [center.x - halfW, center.y - halfH],
+                [center.x + halfW, center.y - halfH],
+                [center.x + halfW, center.y + halfH],
+                [center.x - halfW, center.y + halfH]
+            ]
+        }
+        
+        // Calcular el factor de perspectiva (convergencia de líneas verticales)
+        let topWidth = sqrt(pow(pTR[0] - pTL[0], 2) + pow(pTR[1] - pTL[1], 2))
+        let bottomWidth = sqrt(pow(pBR[0] - pBL[0], 2) + pow(pBR[1] - pBL[1], 2))
+        
+        guard topWidth > 0.001, bottomWidth > 0.001 else {
+            return [
+                [center.x - halfW, center.y - halfH],
+                [center.x + halfW, center.y - halfH],
+                [center.x + halfW, center.y + halfH],
+                [center.x - halfW, center.y + halfH]
+            ]
+        }
+        
+        // Posición relativa del centro dentro del plano (0-1)
+        let planeCenterX = (pTL[0] + pTR[0] + pBR[0] + pBL[0]) / 4
+        let planeCenterY = (pTL[1] + pTR[1] + pBR[1] + pBL[1]) / 4
+        let planeHeight = sqrt(pow(planeCenterX - (pTL[0] + pBL[0]) / 2, 2) + pow(planeCenterY - (pTL[1] + pBL[1]) / 2, 2)) * 2
+        
+        let relY = planeHeight > 0.001 ? (center.y - min(pTL[1], pTR[1])) / planeHeight : 0.5
+        
+        // Interpolar ancho en la posición del cuadro
+        let perspectiveRatio = topWidth > 0 ? bottomWidth / topWidth : 1.0
+        let localRatio = 1.0 + (perspectiveRatio - 1.0) * relY
+        
+        let topHalfW = halfW / localRatio
+        let bottomHalfW = halfW * localRatio
+        
+        return [
+            [center.x - topHalfW, center.y - halfH],
+            [center.x + topHalfW, center.y - halfH],
+            [center.x + bottomHalfW, center.y + halfH],
+            [center.x - bottomHalfW, center.y + halfH]
+        ]
+    }
+    
+    /// Elimina un cuadro con perspectiva.
+    private func deletePerspectiveFrame(id: UUID) {
+        guard var currentData = data, var snapshot = currentData.sceneSnapshot else { return }
+        snapshot.perspectiveFrames.removeAll { $0.id == id }
+        currentData.sceneSnapshot = snapshot
+        data = currentData
+        selectedFrameId = nil
+        HapticService.shared.impact(style: .light)
+    }
+    
     private func resizeFrame(id: UUID, increase: Bool) {
         guard var currentData = data else { return }
         guard let index = currentData.frames.firstIndex(where: { $0.id == id }) else { return }
@@ -892,11 +1165,21 @@ struct OffsiteCaptureDetailView: View {
         guard var currentData = data else { return }
         currentData.lastModified = Date()
         
+        // Sincronizar mediciones del snapshot con las del nivel superior
+        if var snapshot = currentData.sceneSnapshot {
+            snapshot.measurements = currentData.measurements
+            snapshot.frames = currentData.frames
+            snapshot.textAnnotations = currentData.textAnnotations
+            snapshot.lastModified = Date()
+            currentData.sceneSnapshot = snapshot
+        }
+        
         do {
             let encoder = JSONEncoder()
             encoder.dateEncodingStrategy = .iso8601
             encoder.outputFormatting = .prettyPrinted
             try encoder.encode(currentData).write(to: entry.jsonURL)
+            data = currentData
             HapticService.shared.notification(type: .success)
             isEditMode = false
             editTool = .none
@@ -950,6 +1233,34 @@ struct OffsiteCaptureDetailView: View {
         let w = imageSize.width * scale
         let h = imageSize.height * scale
         return CGPoint(x: (viewSize.width - w) / 2, y: (viewSize.height - h) / 2)
+    }
+}
+
+// MARK: - Overlay Toggle
+
+struct OverlayToggle: View {
+    let icon: String
+    let label: String
+    @Binding var isOn: Bool
+    let color: Color
+    
+    var body: some View {
+        Button {
+            isOn.toggle()
+            HapticService.shared.impact(style: .light)
+        } label: {
+            VStack(spacing: 2) {
+                Image(systemName: icon)
+                    .font(.system(size: 14))
+                    .foregroundStyle(isOn ? color : .gray)
+                Text(label)
+                    .font(.system(size: 8))
+                    .foregroundStyle(isOn ? .white : .gray)
+            }
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 4)
+            .background(isOn ? color.opacity(0.2) : Color.clear, in: RoundedRectangle(cornerRadius: 8))
+        }
     }
 }
 

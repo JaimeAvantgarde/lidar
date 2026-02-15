@@ -77,7 +77,7 @@ final class OffsiteCaptureDetailViewModel {
     private let logger = Logger(subsystem: Bundle.main.bundleIdentifier ?? "lidar", category: "OffsiteDetailVM")
 
     enum EditTool: Equatable {
-        case none, measure, frame, text
+        case none, measure, frame, text, placeFrame
     }
 
     init(
@@ -122,6 +122,8 @@ final class OffsiteCaptureDetailViewModel {
             pendingTextNormalizedPoint = normalizedPoint
             newTextPosition = location
             showTextInput = true
+        case .placeFrame:
+            handlePlaceFrameOnWall(point: normalizedPoint)
         case .none:
             break
         }
@@ -229,12 +231,84 @@ final class OffsiteCaptureDetailViewModel {
         hapticService.notification(type: .success)
     }
 
+    private func handlePlaceFrameOnWall(point: NormalizedPoint) {
+        guard var currentData = data,
+              let snapshot = currentData.sceneSnapshot else {
+            // Fallback: place a regular frame
+            handleFrameTap(point: point)
+            return
+        }
+
+        // Find the plane containing the tapped point
+        guard let plane = snapshot.planes.first(where: { planeContains(point: point, plane: $0) }) else {
+            // No plane at this point, place regular frame
+            handleFrameTap(point: point)
+            return
+        }
+
+        // Calculate perspective frame corners based on the plane's projected vertices
+        let halfW = Double(AppConstants.OffsiteEditor.defaultFrameSize) / 2
+        let halfH = Double(AppConstants.OffsiteEditor.defaultFrameSize) / 2
+        let corners: [[Double]] = [
+            [point.x - halfW, point.y - halfH],
+            [min(1, point.x + halfW), point.y - halfH],
+            [min(1, point.x + halfW), min(1, point.y + halfH)],
+            [point.x - halfW, min(1, point.y + halfH)]
+        ]
+        let perspectiveFrame = OffsiteFramePerspective(
+            planeId: plane.id,
+            center2D: point,
+            corners2D: corners,
+            widthMeters: plane.widthMeters * Double(AppConstants.OffsiteEditor.defaultFrameSize),
+            heightMeters: plane.heightMeters * Double(AppConstants.OffsiteEditor.defaultFrameSize),
+            label: "Cuadro \((snapshot.perspectiveFrames.count) + 1)",
+            color: AppConstants.OffsiteEditor.availableColors.randomElement() ?? "#3B82F6"
+        )
+
+        // Add to snapshot's perspective frames
+        var updatedSnapshot = snapshot
+        updatedSnapshot.perspectiveFrames.append(perspectiveFrame)
+        currentData.sceneSnapshot = updatedSnapshot
+        data = currentData
+        hapticService.notification(type: .success)
+        logger.info("Frame colocado en plano con perspectiva: \(plane.id)")
+    }
+
+    private func planeContains(point: NormalizedPoint, plane: OffsitePlaneData) -> Bool {
+        let vertices = plane.projectedVertices
+        guard vertices.count >= 3 else { return false }
+
+        // Point-in-polygon (ray casting)
+        var inside = false
+        var j = vertices.count - 1
+        for i in 0..<vertices.count {
+            guard vertices[i].count >= 2, vertices[j].count >= 2 else { j = i; continue }
+            let xi = vertices[i][0], yi = vertices[i][1]
+            let xj = vertices[j][0], yj = vertices[j][1]
+            if ((yi > point.y) != (yj > point.y)) &&
+               (point.x < (xj - xi) * (point.y - yi) / (yj - yi) + xi) {
+                inside.toggle()
+            }
+            j = i
+        }
+        return inside
+    }
+
     private func calculateDistance(from pointA: CGPoint, to pointB: CGPoint, viewSize: CGSize, imageSize: CGSize) -> Double {
         let dx = pointB.x - pointA.x
         let dy = pointB.y - pointA.y
         let pixelDistance = sqrt(dx * dx + dy * dy)
 
-        // Usar mediciones AR como referencia de escala si están disponibles
+        // Priority 1: Use scene snapshot's metersPerPixelScale (most accurate)
+        if let currentData = data,
+           let snapshot = currentData.sceneSnapshot,
+           let sceneScale = snapshot.metersPerPixelScale,
+           sceneScale > 0 {
+            let scale = scaleToFit(imageSize: imageSize, in: viewSize)
+            return pixelDistance / scale * sceneScale
+        }
+
+        // Priority 2: Usar mediciones AR como referencia de escala
         if let currentData = data,
            let arMeasurement = currentData.measurements.first(where: { $0.isFromAR }) {
             let scale = scaleToFit(imageSize: imageSize, in: viewSize)

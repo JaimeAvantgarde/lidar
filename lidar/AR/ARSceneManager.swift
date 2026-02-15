@@ -45,6 +45,31 @@ final class ARSceneManager: NSObject {
     /// Zoom al medir: escala de la vista (1.0 = normal, 2.0 = 2x zoom). Afecta solo en modo medición.
     var measurementZoomScale: Float = 1.0
 
+    // MARK: - Planos, esquinas y snap
+    /// Si true, se muestran overlays visuales sobre los planos detectados.
+    var showPlaneOverlays: Bool = false
+    /// Si true, se muestran marcadores en las esquinas detectadas.
+    var showCornerMarkers: Bool = false
+    /// Si true, los puntos de medición se ajustan a bordes/esquinas cercanos.
+    var snapToEdgesEnabled: Bool = true
+    /// Si true, los cuadros se colocan alineados al plano (sin billboard).
+    var useFramePerspective: Bool = false
+    /// Plano seleccionado manualmente por el usuario.
+    var selectedPlaneAnchor: ARPlaneAnchor?
+    /// Esquinas detectadas entre planos.
+    var detectedCorners: [(position: SIMD3<Float>, planeA: ARPlaneAnchor, planeB: ARPlaneAnchor, angle: Float)] = []
+    /// Último punto de snap detectado (nil si no hay snap activo).
+    var lastSnapPoint: SIMD3<Float>?
+    /// Nodos de overlay para cada plano (key = anchor identifier).
+    private var planeOverlayNodes: [UUID: SCNNode] = [:]
+    /// Nodos de marcadores de esquinas.
+    private var cornerMarkerNodes: [SCNNode] = []
+    /// Nodo de marcador de snap temporal.
+    private var snapMarkerNode: SCNNode?
+
+    /// Alias: misma lista que detectedPlanes, para uso más explícito.
+    var detectedPlaneAnchors: [ARPlaneAnchor] { detectedPlanes }
+
     /// Última medición (conveniencia para UI).
     var lastMeasurementResult: (distance: Float, pointA: SIMD3<Float>, pointB: SIMD3<Float>)? {
         guard let last = measurements.last else { return nil }
@@ -91,7 +116,8 @@ final class ARSceneManager: NSObject {
     
     // MARK: - Cuadros (objetos)
     
-    /// Colocar un cuadro (foto de galería) en el punto 3D; si hay esquina de dos paredes, se adapta en L.
+    /// Colocar un cuadro (foto de galería) en el punto 3D con la perspectiva del plano.
+    /// Si hay esquina de dos paredes, se adapta en L.
     func placeFrame(at position: SIMD3<Float>, on planeAnchor: ARPlaneAnchor?, size: CGSize = CGSize(width: 0.5, height: 0.5)) {
         let image = selectedFrameImage
         if let anchor = planeAnchor, let otherAnchor = findCornerPlane(near: position, from: anchor) {
@@ -105,12 +131,18 @@ final class ARSceneManager: NSObject {
             let frameNode = createFrameNode(size: size, image: image)
             frameNode.simdPosition = position
             if let anchor = planeAnchor {
+                // Alinear el cuadro con la perspectiva real del plano
                 frameNode.simdOrientation = orientationForPlane(anchor: anchor)
+                
+                // Offset ligeramente fuera del plano para evitar z-fighting
+                let normal = planeNormal(anchor)
+                frameNode.simdPosition = position + normal * 0.005
             }
             let placed = PlacedFrame(node: frameNode, planeAnchor: planeAnchor, size: size, image: image, isCornerFrame: false)
             sceneView?.scene.rootNode.addChildNode(frameNode)
             placedFrames.append(placed)
             selectedFrameId = placed.id
+            selectedPlaneAnchor = planeAnchor
         }
     }
     
@@ -205,20 +237,152 @@ final class ARSceneManager: NSObject {
         removeFirstPointMarker()
     }
 
-    /// Registra un punto en la escena AR. Si es el primero, lo guarda y muestra marcador; si es el segundo, crea la medición.
+    /// Registra un punto en la escena AR. Aplica snap a bordes/esquinas si está habilitado.
+    /// Si es el primero, lo guarda y muestra marcador; si es el segundo, crea la medición.
     func addMeasurementPoint(_ position: SIMD3<Float>) {
         guard isMeasurementMode else { return }
+        let snappedPosition = snapToEdgesEnabled ? snapToNearestEdgeOrCorner(position) : position
+        
         if let first = measurementFirstPoint {
             removeFirstPointMarker()
-            let distance = simd_distance(first, position)
-            let measurement = ARMeasurement(pointA: first, pointB: position, distance: distance)
+            removeSnapMarker()
+            let distance = simd_distance(first, snappedPosition)
+            let measurement = ARMeasurement(pointA: first, pointB: snappedPosition, distance: distance)
             measurements.append(measurement)
             addMeasurementDisplay(measurement: measurement)
             measurementFirstPoint = nil
         } else {
-            measurementFirstPoint = position
-            showFirstPointMarker(at: position)
+            measurementFirstPoint = snappedPosition
+            showFirstPointMarker(at: snappedPosition)
         }
+    }
+    
+    /// Intenta hacer snap del punto a la esquina o borde de plano más cercano.
+    private func snapToNearestEdgeOrCorner(_ position: SIMD3<Float>) -> SIMD3<Float> {
+        // 1. Primero intentar snap a esquina detectada
+        let snapCornerDist = AppConstants.AR.snapToCornerDistance
+        var bestCorner: SIMD3<Float>?
+        var bestCornerDist: Float = snapCornerDist
+        
+        for corner in detectedCorners {
+            let d = simd_distance(position, corner.position)
+            if d < bestCornerDist {
+                bestCornerDist = d
+                bestCorner = corner.position
+            }
+        }
+        
+        if let corner = bestCorner {
+            showSnapMarker(at: corner, isCorner: true)
+            return corner
+        }
+        
+        // 2. Intentar snap a borde de plano
+        let snapEdgeDist = AppConstants.AR.snapToEdgeDistance
+        var bestEdgePoint: SIMD3<Float>?
+        var bestEdgeDist: Float = snapEdgeDist
+        
+        for plane in detectedPlanes where plane.alignment == .vertical {
+            let edgePoints = getPlaneEdgePoints(plane)
+            for edgePoint in edgePoints {
+                let d = simd_distance(position, edgePoint)
+                if d < bestEdgeDist {
+                    bestEdgeDist = d
+                    bestEdgePoint = edgePoint
+                }
+            }
+            // Also snap to nearest point on plane edge lines
+            if let nearest = nearestPointOnPlaneEdges(position, plane: plane), simd_distance(position, nearest) < snapEdgeDist {
+                let d = simd_distance(position, nearest)
+                if d < bestEdgeDist {
+                    bestEdgeDist = d
+                    bestEdgePoint = nearest
+                }
+            }
+        }
+        
+        if let edgePoint = bestEdgePoint {
+            showSnapMarker(at: edgePoint, isCorner: false)
+            return edgePoint
+        }
+        
+        removeSnapMarker()
+        return position
+    }
+    
+    /// Obtiene los 4 puntos de las esquinas de un plano.
+    private func getPlaneEdgePoints(_ anchor: ARPlaneAnchor) -> [SIMD3<Float>] {
+        let t = anchor.transform
+        let center = SIMD3<Float>(t.columns.3.x, t.columns.3.y, t.columns.3.z)
+        let halfW = anchor.extent.x / 2
+        let halfH = anchor.extent.z / 2
+        
+        let right = simd_normalize(SIMD3<Float>(t.columns.0.x, t.columns.0.y, t.columns.0.z))
+        let forward = simd_normalize(SIMD3<Float>(t.columns.2.x, t.columns.2.y, t.columns.2.z))
+        
+        return [
+            center + right * halfW + forward * halfH,
+            center + right * halfW - forward * halfH,
+            center - right * halfW + forward * halfH,
+            center - right * halfW - forward * halfH
+        ]
+    }
+    
+    /// Punto más cercano en los bordes del plano.
+    private func nearestPointOnPlaneEdges(_ point: SIMD3<Float>, plane: ARPlaneAnchor) -> SIMD3<Float>? {
+        let edges = getPlaneEdgePoints(plane)
+        guard edges.count == 4 else { return nil }
+        
+        let segments = [
+            (edges[0], edges[1]), (edges[1], edges[3]),
+            (edges[3], edges[2]), (edges[2], edges[0])
+        ]
+        
+        var best: SIMD3<Float>?
+        var bestDist: Float = .infinity
+        
+        for (a, b) in segments {
+            let ab = b - a
+            let ap = point - a
+            let t = max(0, min(1, simd_dot(ap, ab) / simd_dot(ab, ab)))
+            let projected = a + t * ab
+            let d = simd_distance(point, projected)
+            if d < bestDist {
+                bestDist = d
+                best = projected
+            }
+        }
+        return best
+    }
+    
+    /// Muestra marcador de snap (diamante para esquina, cuadrado para borde).
+    private func showSnapMarker(at position: SIMD3<Float>, isCorner: Bool) {
+        removeSnapMarker()
+        guard let sceneView = sceneView else { return }
+        
+        let geo: SCNGeometry
+        if isCorner {
+            geo = SCNSphere(radius: AppConstants.AR.cornerMarkerRadius)
+            geo.firstMaterial?.diffuse.contents = UIColor.systemYellow
+            geo.firstMaterial?.emission.contents = UIColor.yellow.withAlphaComponent(0.5)
+        } else {
+            geo = SCNBox(width: 0.02, height: 0.02, length: 0.02, chamferRadius: 0.005)
+            geo.firstMaterial?.diffuse.contents = UIColor.systemCyan
+            geo.firstMaterial?.emission.contents = UIColor.cyan.withAlphaComponent(0.5)
+        }
+        
+        let node = SCNNode(geometry: geo)
+        node.simdPosition = position
+        node.name = "snap_marker"
+        sceneView.scene.rootNode.addChildNode(node)
+        snapMarkerNode = node
+        lastSnapPoint = position
+    }
+    
+    private func removeSnapMarker() {
+        snapMarkerNode?.removeFromParentNode()
+        snapMarkerNode = nil
+        lastSnapPoint = nil
     }
 
     /// Marcador visible para el primer punto (esfera pequeña).
@@ -330,6 +494,220 @@ final class ARSceneManager: NSObject {
         }
     }
 
+    // MARK: - Detección de esquinas y visualización de planos
+    
+    /// Detecta todas las esquinas entre planos verticales y actualiza la lista.
+    func detectAllCorners() {
+        detectedCorners.removeAll()
+        let verticalPlanes = detectedPlanes.filter { $0.alignment == .vertical }
+        
+        for i in 0..<verticalPlanes.count {
+            for j in (i+1)..<verticalPlanes.count {
+                let planeA = verticalPlanes[i]
+                let planeB = verticalPlanes[j]
+                
+                if let corner = detectCorner(between: planeA, and: planeB) {
+                    detectedCorners.append(corner)
+                }
+            }
+        }
+        
+        if showCornerMarkers {
+            updateCornerMarkerVisuals()
+        }
+    }
+    
+    /// Detecta si dos planos forman una esquina.
+    private func detectCorner(between planeA: ARPlaneAnchor, and planeB: ARPlaneAnchor) -> (position: SIMD3<Float>, planeA: ARPlaneAnchor, planeB: ARPlaneAnchor, angle: Float)? {
+        let n1 = planeNormal(planeA)
+        let n2 = planeNormal(planeB)
+        let dot = abs(simd_dot(n1, n2))
+        
+        // Check angle is within corner range (60°-120°)
+        let angle = acos(min(1.0, max(-1.0, simd_dot(n1, n2)))) * 180 / .pi
+        guard angle >= Float(AppConstants.AR.cornerMinAngle) && angle <= Float(AppConstants.AR.cornerMaxAngle) else { return nil }
+        
+        // Check distance between plane centers
+        let centerA = SIMD3<Float>(planeA.transform.columns.3.x, planeA.transform.columns.3.y, planeA.transform.columns.3.z)
+        let centerB = SIMD3<Float>(planeB.transform.columns.3.x, planeB.transform.columns.3.y, planeB.transform.columns.3.z)
+        let dist = simd_distance(centerA, centerB)
+        
+        guard dist < AppConstants.AR.cornerDetectionMaxDistance else { return nil }
+        
+        // Find intersection line of the two planes and estimate corner position
+        let edgesA = getPlaneEdgePoints(planeA)
+        let edgesB = getPlaneEdgePoints(planeB)
+        
+        // Find closest pair of edge points between the two planes
+        var bestDist: Float = .infinity
+        var bestMidpoint = (centerA + centerB) * 0.5
+        
+        for ea in edgesA {
+            for eb in edgesB {
+                let d = simd_distance(ea, eb)
+                if d < bestDist {
+                    bestDist = d
+                    bestMidpoint = (ea + eb) * 0.5
+                }
+            }
+        }
+        
+        return (position: bestMidpoint, planeA: planeA, planeB: planeB, angle: angle)
+    }
+    
+    /// Actualiza los marcadores visuales de esquinas en la escena.
+    private func updateCornerMarkerVisuals() {
+        // Remove existing
+        for node in cornerMarkerNodes {
+            node.removeFromParentNode()
+        }
+        cornerMarkerNodes.removeAll()
+        
+        guard let sceneView = sceneView, showCornerMarkers else { return }
+        
+        for corner in detectedCorners {
+            let sphere = SCNSphere(radius: AppConstants.AR.cornerMarkerRadius)
+            sphere.firstMaterial?.diffuse.contents = UIColor.systemYellow
+            sphere.firstMaterial?.emission.contents = UIColor.yellow.withAlphaComponent(0.4)
+            sphere.firstMaterial?.transparency = 0.8
+            
+            let node = SCNNode(geometry: sphere)
+            node.simdPosition = corner.position
+            node.name = "corner_marker"
+            
+            // Add angle text
+            let angleText = SCNText(string: String(format: "%.0f°", corner.angle), extrusionDepth: 0.003)
+            angleText.font = .systemFont(ofSize: 0.04, weight: .bold)
+            angleText.firstMaterial?.diffuse.contents = UIColor.systemYellow
+            angleText.firstMaterial?.isDoubleSided = true
+            let textNode = SCNNode(geometry: angleText)
+            let s: Float = 0.25
+            textNode.scale = SCNVector3(s, s, s)
+            textNode.position = SCNVector3(0, 0.05, 0)
+            let billboard = SCNBillboardConstraint()
+            billboard.freeAxes = .Y
+            textNode.constraints = [billboard]
+            node.addChildNode(textNode)
+            
+            sceneView.scene.rootNode.addChildNode(node)
+            cornerMarkerNodes.append(node)
+        }
+    }
+    
+    /// Actualiza los overlays visuales de planos detectados.
+    func updatePlaneOverlays() {
+        guard showPlaneOverlays, let sceneView = sceneView else {
+            // Remove all if disabled
+            for node in planeOverlayNodes.values { node.removeFromParentNode() }
+            planeOverlayNodes.removeAll()
+            return
+        }
+        
+        // Track which planes still exist
+        var existingIds = Set<UUID>()
+        
+        for plane in detectedPlanes {
+            let planeId = UUID(uuidString: plane.identifier.uuidString) ?? UUID()
+            existingIds.insert(planeId)
+            
+            if let existingNode = planeOverlayNodes[planeId] {
+                // Update existing overlay
+                updatePlaneOverlayNode(existingNode, for: plane)
+            } else {
+                // Create new overlay
+                let node = createPlaneOverlayNode(for: plane)
+                sceneView.scene.rootNode.addChildNode(node)
+                planeOverlayNodes[planeId] = node
+            }
+        }
+        
+        // Remove overlays for planes that no longer exist
+        let toRemove = planeOverlayNodes.keys.filter { !existingIds.contains($0) }
+        for id in toRemove {
+            planeOverlayNodes[id]?.removeFromParentNode()
+            planeOverlayNodes.removeValue(forKey: id)
+        }
+    }
+    
+    private func createPlaneOverlayNode(for anchor: ARPlaneAnchor) -> SCNNode {
+        let w = CGFloat(anchor.extent.x)
+        let h = CGFloat(anchor.extent.z)
+        let plane = SCNPlane(width: w, height: h)
+        
+        let color: UIColor = anchor.alignment == .vertical ? .systemBlue : .systemGreen
+        plane.firstMaterial?.diffuse.contents = color.withAlphaComponent(CGFloat(AppConstants.AR.planeOverlayOpacity))
+        plane.firstMaterial?.isDoubleSided = true
+        plane.firstMaterial?.transparency = 1.0
+        
+        let node = SCNNode(geometry: plane)
+        node.name = "plane_overlay"
+        
+        let t = anchor.transform
+        node.simdTransform = t
+        
+        // For vertical planes, rotate to face outward
+        if anchor.alignment == .vertical {
+            node.eulerAngles.x = -.pi / 2
+        }
+        
+        // Add dimension labels
+        addDimensionLabels(to: node, width: Float(w), height: Float(h), isVertical: anchor.alignment == .vertical)
+        
+        return node
+    }
+    
+    private func updatePlaneOverlayNode(_ node: SCNNode, for anchor: ARPlaneAnchor) {
+        let w = CGFloat(anchor.extent.x)
+        let h = CGFloat(anchor.extent.z)
+        
+        if let plane = node.geometry as? SCNPlane {
+            plane.width = w
+            plane.height = h
+        }
+        
+        node.simdTransform = anchor.transform
+        
+        // Update dimension labels
+        node.childNodes.filter { $0.name == "dim_label" }.forEach { $0.removeFromParentNode() }
+        addDimensionLabels(to: node, width: Float(w), height: Float(h), isVertical: anchor.alignment == .vertical)
+    }
+    
+    private func addDimensionLabels(to node: SCNNode, width: Float, height: Float, isVertical: Bool) {
+        let label = String(format: "%.2f × %.2f m", width, height)
+        let text = SCNText(string: label, extrusionDepth: 0.002)
+        text.font = .systemFont(ofSize: 0.03, weight: .semibold)
+        text.firstMaterial?.diffuse.contents = UIColor.white
+        text.firstMaterial?.emission.contents = UIColor.white.withAlphaComponent(0.3)
+        text.firstMaterial?.isDoubleSided = true
+        
+        let textNode = SCNNode(geometry: text)
+        let s = AppConstants.AR.dimensionTextScale
+        textNode.scale = SCNVector3(s, s, s)
+        textNode.name = "dim_label"
+        
+        let billboard = SCNBillboardConstraint()
+        billboard.freeAxes = .Y
+        textNode.constraints = [billboard]
+        
+        node.addChildNode(textNode)
+    }
+    
+    /// Clasifica un plano ARKit.
+    func classifyPlane(_ anchor: ARPlaneAnchor) -> PlaneClassification {
+        if #available(iOS 13.0, *) {
+            switch anchor.classification {
+            case .wall: return .wall
+            case .floor: return .floor
+            case .ceiling: return .ceiling
+            case .door: return .door
+            case .window: return .window
+            default: break
+            }
+        }
+        // Fallback: clasificar por alineación
+        return anchor.alignment == .vertical ? .wall : .floor
+    }
+
     // MARK: - Captura offsite
 
     enum CaptureError: Error, LocalizedError {
@@ -348,12 +726,15 @@ final class ARSceneManager: NSObject {
         }
     }
 
-    /// Captura la vista AR actual con todas las mediciones y cuadros con posiciones 2D normalizadas.
-    /// Guarda TODOS los datos del LiDAR: dimensiones reales, imágenes de cuadros, metadata de planos.
-    /// Usa `StorageService` para persistir imagen + JSON en Documents/OffsiteCaptures/.
+    /// Captura la vista AR actual con TODOS los datos 3D de la escena.
+    /// Incluye: planos con vértices proyectados, esquinas, mediciones, cuadros con perspectiva,
+    /// datos de cámara, metadata del LiDAR, y dimensiones de todas las paredes.
     /// - Returns: (URL de la imagen, URL del JSON) o lanza error si falla.
     func captureForOffsite() throws -> (imageURL: URL, jsonURL: URL) {
         guard let sceneView = sceneView else { throw CaptureError.noSceneView }
+        
+        // Actualizar detección de esquinas antes de capturar
+        detectAllCorners()
         
         // Capturar con alta resolución (escala 2x en dispositivos retina)
         let scale = UIScreen.main.scale
@@ -369,7 +750,7 @@ final class ARSceneManager: NSObject {
         let h = sceneView.bounds.height
         guard w > 0, h > 0 else { throw CaptureError.invalidBounds }
 
-        // Proyectar mediciones 3D a coordenadas 2D normalizadas
+        // === 1. Proyectar mediciones 3D a coordenadas 2D normalizadas ===
         let offsiteMeasurements: [OffsiteMeasurement] = measurements.map { m in
             let pa = sceneView.projectPoint(SCNVector3(m.pointA.x, m.pointA.y, m.pointA.z))
             let pb = sceneView.projectPoint(SCNVector3(m.pointB.x, m.pointB.y, m.pointB.z))
@@ -378,38 +759,39 @@ final class ARSceneManager: NSObject {
             return OffsiteMeasurement(id: m.id, distanceMeters: Double(m.distance), pointA: pointA, pointB: pointB, isFromAR: true)
         }
         
-        // Proyectar cuadros 3D a coordenadas 2D normalizadas CON TODOS LOS DATOS
+        // === 2. Proyectar cuadros con perspectiva REAL ===
         let offsiteFrames: [OffsiteFrame] = placedFrames.compactMap { frame in
-            // Proyectar el centro del cuadro
             let frameNode = frame.node
             let framePosition = frameNode.simdWorldPosition
-            let projected = sceneView.projectPoint(SCNVector3(framePosition))
-            
-            // Dimensiones REALES del cuadro en metros
             let frameWidthMeters = Double(frame.size.width)
             let frameHeightMeters = Double(frame.size.height)
             
-            // Proyectar las esquinas del cuadro para obtener dimensiones en 2D
+            // Calcular las 4 esquinas del cuadro en 3D usando su orientación real
             let halfW = Float(frame.size.width) / 2.0
             let halfH = Float(frame.size.height) / 2.0
             
-            let topLeft3D = framePosition + simd_make_float3(-halfW, halfH, 0)
-            let bottomRight3D = framePosition + simd_make_float3(halfW, -halfH, 0)
+            // Usar la orientación real del nodo para las esquinas
+            let right = frameNode.simdWorldRight
+            let up = frameNode.simdWorldUp
             
-            let projTL = sceneView.projectPoint(SCNVector3(topLeft3D))
-            let projBR = sceneView.projectPoint(SCNVector3(bottomRight3D))
+            let tl3D = framePosition - right * halfW + up * halfH
+            let tr3D = framePosition + right * halfW + up * halfH
+            let br3D = framePosition + right * halfW - up * halfH
+            let bl3D = framePosition - right * halfW - up * halfH
+            
+            let projTL = sceneView.projectPoint(SCNVector3(tl3D))
+            let projTR = sceneView.projectPoint(SCNVector3(tr3D))
+            let projBR = sceneView.projectPoint(SCNVector3(br3D))
+            let projBL = sceneView.projectPoint(SCNVector3(bl3D))
             
             let topLeftNorm = NormalizedPoint(x: Double(projTL.x) / Double(w), y: Double(projTL.y) / Double(h))
-            let widthNorm = Double(abs(projBR.x - projTL.x)) / Double(w)
-            let heightNorm = Double(abs(projBR.y - projTL.y)) / Double(h)
+            let widthNorm = Double(abs(projTR.x - projTL.x)) / Double(w)
+            let heightNorm = Double(abs(projBL.y - projTL.y)) / Double(h)
             
-            // Solo incluir si está visible en pantalla
-            guard topLeftNorm.isValid || (topLeftNorm.x >= -0.1 && topLeftNorm.x <= 1.1 && topLeftNorm.y >= -0.1 && topLeftNorm.y <= 1.1) else {
-                logger.warning("Cuadro fuera de vista, omitiendo")
+            guard topLeftNorm.x >= -0.2 && topLeftNorm.x <= 1.2 && topLeftNorm.y >= -0.2 && topLeftNorm.y <= 1.2 else {
                 return nil
             }
             
-            // Convertir imagen a base64 para guardarla
             var imageBase64: String?
             if let frameImage = frame.image,
                let jpegData = frameImage.jpegData(compressionQuality: 0.8) {
@@ -430,14 +812,142 @@ final class ARSceneManager: NSObject {
             )
         }
         
-        // Capturar metadata del LiDAR
+        // === 3. Cuadros con perspectiva real (4 esquinas proyectadas) ===
+        let perspFrames: [OffsiteFramePerspective] = placedFrames.compactMap { frame in
+            let frameNode = frame.node
+            let pos: SIMD3<Float> = frameNode.simdWorldPosition
+            let halfW: Float = Float(frame.size.width) / 2.0
+            let halfH: Float = Float(frame.size.height) / 2.0
+            let right: SIMD3<Float> = frameNode.simdWorldRight
+            let up: SIMD3<Float> = frameNode.simdWorldUp
+            
+            let rW: SIMD3<Float> = right * halfW
+            let uH: SIMD3<Float> = up * halfH
+            let tl: SIMD3<Float> = pos - rW + uH
+            let tr: SIMD3<Float> = pos + rW + uH
+            let br: SIMD3<Float> = pos + rW - uH
+            let bl: SIMD3<Float> = pos - rW - uH
+            let corners3D: [SIMD3<Float>] = [tl, tr, br, bl]
+            
+            let corners2D = corners3D.map { pt -> [Double] in
+                let p = sceneView.projectPoint(SCNVector3(pt))
+                return [Double(p.x) / Double(w), Double(p.y) / Double(h)]
+            }
+            
+            let center = sceneView.projectPoint(SCNVector3(pos))
+            let center2D = NormalizedPoint(x: Double(center.x) / Double(w), y: Double(center.y) / Double(h))
+            
+            var imageBase64: String?
+            if let img = frame.image, let data = img.jpegData(compressionQuality: 0.8) {
+                imageBase64 = data.base64EncodedString()
+            }
+            
+            return OffsiteFramePerspective(
+                id: frame.id,
+                planeId: frame.planeAnchor?.identifier.uuidString,
+                center2D: center2D,
+                corners2D: corners2D,
+                widthMeters: Double(frame.size.width),
+                heightMeters: Double(frame.size.height),
+                imageBase64: imageBase64,
+                label: nil,
+                color: "#3B82F6"
+            )
+        }
+        
+        // === 4. Exportar TODOS los planos con vértices 2D proyectados ===
+        let offsitePlanes: [OffsitePlaneData] = detectedPlanes.map { plane in
+            let t = plane.transform
+            let center = SIMD3<Float>(t.columns.3.x, t.columns.3.y, t.columns.3.z)
+            let normal = planeNormal(plane)
+            let classification = classifyPlane(plane)
+            
+            // Obtener vértices 3D del plano (4 esquinas)
+            let edges = getPlaneEdgePoints(plane)
+            
+            // Proyectar vértices a 2D
+            let projected = edges.map { pt -> [Double] in
+                let p = sceneView.projectPoint(SCNVector3(pt))
+                return [Double(p.x) / Double(w), Double(p.y) / Double(h)]
+            }
+            
+            return OffsitePlaneData(
+                id: plane.identifier.uuidString,
+                alignment: plane.alignment == .vertical ? "vertical" : "horizontal",
+                classification: classification,
+                transform: flattenTransform(t),
+                extentX: Double(plane.extent.x),
+                extentZ: Double(plane.extent.z),
+                center3D: [center.x, center.y, center.z],
+                normal: [normal.x, normal.y, normal.z],
+                projectedVertices: projected,
+                widthMeters: Double(plane.extent.x),
+                heightMeters: Double(plane.extent.z)
+            )
+        }
+        
+        // === 5. Exportar esquinas ===
+        let offsiteCorners: [OffsiteCornerData] = detectedCorners.map { corner in
+            let p = sceneView.projectPoint(SCNVector3(corner.position))
+            let pos2D = NormalizedPoint(x: Double(p.x) / Double(w), y: Double(p.y) / Double(h))
+            return OffsiteCornerData(
+                position3D: corner.position,
+                position2D: pos2D,
+                angleDegrees: Double(corner.angle),
+                planeIdA: corner.planeA.identifier.uuidString,
+                planeIdB: corner.planeB.identifier.uuidString
+            )
+        }
+        
+        // === 6. Dimensiones de paredes ===
+        let wallDims: [OffsiteWallDimension] = detectedPlanes.filter { $0.alignment == .vertical }.map { plane in
+            let edges = getPlaneEdgePoints(plane)
+            let verts = edges.map { pt -> [Double] in
+                let p = sceneView.projectPoint(SCNVector3(pt))
+                return [Double(p.x) / Double(w), Double(p.y) / Double(h)]
+            }
+            return OffsiteWallDimension(
+                planeId: plane.identifier.uuidString,
+                widthMeters: Double(plane.extent.x),
+                heightMeters: Double(plane.extent.z),
+                vertices2D: verts
+            )
+        }
+        
+        // === 7. Datos de cámara ===
+        var cameraData: OffsiteCameraData?
+        if let frame = sceneView.session.currentFrame {
+            cameraData = OffsiteCameraData(
+                intrinsics: frame.camera.intrinsics,
+                transform: frame.camera.transform,
+                imageWidth: Int(w * scale),
+                imageHeight: Int(h * scale)
+            )
+        }
+        
+        // === 8. Metadata del LiDAR ===
         let planeDims = detectedPlanes.map { plane in
-            (width: Double(plane.extent.x), height: Double(plane.extent.z))
+            PlaneDimension(width: Double(plane.extent.x), height: Double(plane.extent.z))
         }
         let lidarMetadata = OffsiteLiDARMetadata(
             isLiDARAvailable: isLiDARAvailable,
             planeCount: detectedPlanes.count,
             planeDimensions: planeDims
+        )
+        
+        // === 9. Crear snapshot completo ===
+        let snapshot = OffsiteSceneSnapshot(
+            capturedAt: Date(),
+            camera: cameraData,
+            planes: offsitePlanes,
+            corners: offsiteCorners,
+            wallDimensions: wallDims,
+            measurements: offsiteMeasurements,
+            perspectiveFrames: perspFrames,
+            frames: offsiteFrames,
+            textAnnotations: [],
+            lidarMetadata: lidarMetadata,
+            imageScale: Double(scale)
         )
         
         let captureData = OffsiteCaptureData(
@@ -446,29 +956,28 @@ final class ARSceneManager: NSObject {
             frames: offsiteFrames,
             textAnnotations: [],
             lidarMetadata: lidarMetadata,
-            imageScale: Double(scale)
+            imageScale: Double(scale),
+            sceneSnapshot: snapshot
         )
-                id: frame.id,
-                topLeft: topLeftNorm,
-                width: widthNorm,
-                height: heightNorm,
-                label: nil,
-                color: "#3B82F6"
-            )
-        }
-        
-        let captureData = OffsiteCaptureData(capturedAt: Date(), measurements: offsiteMeasurements, frames: offsiteFrames, textAnnotations: [])
 
         // Delegar persistencia al StorageService
         do {
             let files = try storageService.createCaptureFiles(image: image)
             try storageService.saveCaptureData(captureData, to: files.jsonURL)
-            logger.info("Captura offsite guardada: \(files.baseName)")
+            logger.info("Captura offsite guardada: \(files.baseName) con \(offsitePlanes.count) planos, \(offsiteCorners.count) esquinas")
             return (files.imageURL, files.jsonURL)
         } catch {
             logger.error("Error en captura offsite: \(error.localizedDescription)")
             throw CaptureError.saveFailed(error)
         }
+    }
+    
+    /// Aplana un simd_float4x4 a array de 16 Float.
+    private func flattenTransform(_ t: simd_float4x4) -> [Float] {
+        [t.columns.0.x, t.columns.0.y, t.columns.0.z, t.columns.0.w,
+         t.columns.1.x, t.columns.1.y, t.columns.1.z, t.columns.1.w,
+         t.columns.2.x, t.columns.2.y, t.columns.2.z, t.columns.2.w,
+         t.columns.3.x, t.columns.3.y, t.columns.3.z, t.columns.3.w]
     }
 
     // MARK: - Helpers
@@ -545,17 +1054,33 @@ final class ARSceneManager: NSObject {
         return nil
     }
 
-    /// Cuadro plano con foto; siempre se ve de frente (billboard) en pared, techo o suelo.
+    /// Cuadro plano con foto. Si useFramePerspective=true, se alinea al plano (pared);
+    /// si false, usa billboard constraint clásico.
     private func createFrameNode(size: CGSize, image: UIImage? = nil) -> SCNNode {
         let plane = SCNPlane(width: size.width, height: size.height)
         plane.firstMaterial?.diffuse.contents = image ?? UIColor.systemGray5
         plane.firstMaterial?.isDoubleSided = true
         plane.firstMaterial?.specular.contents = UIColor.white
+        plane.firstMaterial?.lightingModel = .physicallyBased
         let node = SCNNode(geometry: plane)
         node.name = "frame"
-        let billboard = SCNBillboardConstraint()
-        billboard.freeAxes = .Y
-        node.constraints = [billboard]
+        
+        // Solo usar billboard si la perspectiva no está habilitada
+        if !useFramePerspective {
+            let billboard = SCNBillboardConstraint()
+            billboard.freeAxes = .Y
+            node.constraints = [billboard]
+        }
+        
+        // Añadir borde visual al cuadro
+        let border = SCNPlane(width: size.width + 0.02, height: size.height + 0.02)
+        border.firstMaterial?.diffuse.contents = UIColor.white
+        border.firstMaterial?.isDoubleSided = true
+        let borderNode = SCNNode(geometry: border)
+        borderNode.position = SCNVector3(0, 0, -0.001) // Ligeramente detrás
+        borderNode.name = "frame_border"
+        node.addChildNode(borderNode)
+        
         return node
     }
 
@@ -628,6 +1153,10 @@ extension ARSceneManager: ARSCNViewDelegate {
             }
             let extent = planeAnchor.extent
             lastPlaneDimensions = PlaneDimensions(width: extent.x, height: extent.z, extent: extent)
+            
+            // Actualizar visualizaciones
+            updatePlaneOverlays()
+            detectAllCorners()
         }
     }
     
@@ -639,6 +1168,13 @@ extension ARSceneManager: ARSCNViewDelegate {
             }
             let extent = planeAnchor.extent
             lastPlaneDimensions = PlaneDimensions(width: extent.x, height: extent.z, extent: extent)
+            
+            // Actualizar visualizaciones en cada actualización de plano
+            updatePlaneOverlays()
+            // Detectar esquinas periódicamente (cada 5 actualizaciones para performance)
+            if detectedPlanes.count > 1 {
+                detectAllCorners()
+            }
         }
     }
     
@@ -646,6 +1182,8 @@ extension ARSceneManager: ARSCNViewDelegate {
         guard let planeAnchor = anchor as? ARPlaneAnchor else { return }
         Task { @MainActor in
             detectedPlanes.removeAll { $0.identifier == planeAnchor.identifier }
+            updatePlaneOverlays()
+            detectAllCorners()
         }
     }
 

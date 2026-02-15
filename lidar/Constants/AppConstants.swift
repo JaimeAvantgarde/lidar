@@ -68,6 +68,24 @@ enum AppConstants {
         static let cornerMaxDot: Float = 0.3
         /// Longitud mínima de un vector normal para considerarlo válido
         static let minNormalLength: Float = 0.001
+        /// Radio del marcador de esquina en la escena AR
+        static let cornerMarkerRadius: CGFloat = 0.025
+        /// Grosor de la línea de contorno de plano
+        static let planeOutlineWidth: CGFloat = 0.008
+        /// Distancia máxima para snap a borde de plano (metros)
+        static let snapToEdgeDistance: Float = 0.15
+        /// Distancia máxima para snap a esquina (metros)
+        static let snapToCornerDistance: Float = 0.20
+        /// Opacidad del overlay de plano
+        static let planeOverlayOpacity: CGFloat = 0.12
+        /// Radio del marcador de dimensión en la escena
+        static let dimensionTextScale: Float = 0.25
+        /// Distancia máxima entre planos para considerar esquina
+        static let cornerDetectionMaxDistance: Float = 1.5
+        /// Ángulo mínimo para considerar esquina (grados)
+        static let cornerMinAngle: Double = 60.0
+        /// Ángulo máximo para considerar esquina (grados)  
+        static let cornerMaxAngle: Double = 120.0
     }
 
     // MARK: - Capture (Offsite)
@@ -130,6 +148,24 @@ enum AppConstants {
         static let measurementPointSize: CGFloat = 20
         /// Tamaño del anillo exterior del marcador
         static let measurementPointOuterSize: CGFloat = 32
+        /// Grosor de línea de contorno de plano en offsite
+        static let planeOutlineLineWidth: CGFloat = 2.5
+        /// Grosor de línea de dimensión de plano
+        static let planeDimensionLineWidth: CGFloat = 1.5
+        /// Opacidad del relleno de plano seleccionado
+        static let planeSelectedFillOpacity: Double = 0.15
+        /// Opacidad del relleno de plano no seleccionado
+        static let planeUnselectedFillOpacity: Double = 0.05
+        /// Tamaño del marcador de esquina
+        static let cornerMarkerSize: CGFloat = 16
+        /// Tamaño mínimo de un cuadro offsite (normalizado)
+        static let minFrameSize: Double = 0.03
+        /// Tamaño máximo de un cuadro offsite (normalizado)
+        static let maxFrameSize: Double = 0.6
+        /// Incremento de resize normalizado
+        static let resizeIncrement: Double = 0.015
+        /// Distancia para snap a borde de plano (normalizada)
+        static let snapToPlaneEdge: Double = 0.03
     }
 
     // MARK: - Animation
