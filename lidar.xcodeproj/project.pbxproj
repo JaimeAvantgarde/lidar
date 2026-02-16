@@ -27,6 +27,8 @@
 		4AE486622F3A271000A4793B /* lidar.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = lidar.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		4AE4866F2F3A271100A4793B /* lidarTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = lidarTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		4AE486792F3A271100A4793B /* lidarUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = lidarUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		04503CDE828F4240BE58840F /* OnboardingView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OnboardingView.swift; sourceTree = "<group>"; };
+		9549E819E783498983889228 /* PDFReportService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PDFReportService.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -236,6 +238,8 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				585273FEBE134436ABCA582E /* PDFReportService.swift in Sources */,
+				39EEAE9216C74D39BE4F29B1 /* OnboardingView.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

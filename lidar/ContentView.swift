@@ -62,6 +62,15 @@ struct ContentView: View {
 
             if let error = sceneManager.errorMessage {
                 errorBanner(message: error)
+                    .onAppear {
+                        // Auto-dismiss error after 4 seconds
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 4) {
+                            withAnimation(.easeOut(duration: 0.3)) {
+                                sceneManager.errorMessage = nil
+                            }
+                        }
+                    }
+                    .transition(.move(edge: .top).combined(with: .opacity))
             }
 
             // Hint flotante cuando el panel está colapsado, modo mover o modo medidas

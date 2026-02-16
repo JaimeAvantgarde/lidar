@@ -45,6 +45,12 @@ final class ARSceneManager: NSObject {
     /// Zoom al medir: escala de la vista (1.0 = normal, 2.0 = 2x zoom). Afecta solo en modo medición.
     var measurementZoomScale: Float = 1.0
 
+    // MARK: - Preview de medición en tiempo real
+    /// Nodo temporal que muestra línea + distancia mientras el usuario apunta (antes de confirmar punto 2).
+    private var measurementPreviewNode: SCNNode?
+    /// Timer para actualizar el preview de medición cada frame.
+    private var measurementPreviewTimer: Timer?
+
     // MARK: - Planos, esquinas y snap
     /// Si true, se muestran overlays visuales sobre los planos detectados.
     var showPlaneOverlays: Bool = false
@@ -104,8 +110,11 @@ final class ARSceneManager: NSObject {
         configuration.environmentTexturing = .automatic
         if isLiDARAvailable {
             configuration.sceneReconstruction = .mesh
+            // Solo pedir sceneDepth si LiDAR está disponible (crash en dispositivos sin LiDAR)
+            if ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth) {
+                configuration.frameSemantics.insert(.sceneDepth)
+            }
         }
-        configuration.frameSemantics.insert(.sceneDepth)
         sceneView.session.run(configuration, options: [.resetTracking, .removeExistingAnchors])
         errorMessage = nil
     }
@@ -128,10 +137,11 @@ final class ARSceneManager: NSObject {
             placedFrames.append(placed)
             selectedFrameId = placed.id
         } else {
-            let frameNode = createFrameNode(size: size, image: image)
+            let frameNode = createFrameNode(size: size, image: image, alignToSurface: planeAnchor != nil)
             frameNode.simdPosition = position
             if let anchor = planeAnchor {
-                // Alinear el cuadro con la perspectiva real del plano
+                // Siempre alinear a la superficie — quitar billboard
+                frameNode.constraints = nil
                 frameNode.simdOrientation = orientationForPlane(anchor: anchor)
                 
                 // Offset ligeramente fuera del plano para evitar z-fighting
@@ -153,7 +163,12 @@ final class ARSceneManager: NSObject {
         let node = placed.node
         node.simdPosition = position
         if !placed.isCornerFrame, let anchor = planeAnchor {
+            // Quitar billboard y alinear a la superficie real
+            node.constraints = nil
             node.simdOrientation = orientationForPlane(anchor: anchor)
+            // Offset fuera del plano
+            let normal = planeNormal(anchor)
+            node.simdPosition = position + normal * 0.005
         }
         placedFrames[index].planeAnchor = planeAnchor
         moveModeForFrameId = nil
@@ -189,9 +204,11 @@ final class ARSceneManager: NSObject {
             newNode = cornerNode
             stillCorner = true  // sigue siendo esquina
         } else {
-            newNode = createFrameNode(size: newSize, image: image)
+            let hasPlane = old.planeAnchor != nil
+            newNode = createFrameNode(size: newSize, image: image, alignToSurface: hasPlane)
             newNode.simdPosition = old.node.simdPosition
             newNode.simdOrientation = old.node.simdOrientation
+            if hasPlane { newNode.constraints = nil }
             stillCorner = false
         }
         old.node.removeFromParentNode()
@@ -228,6 +245,7 @@ final class ARSceneManager: NSObject {
         isMeasurementMode = true
         measurementFirstPoint = nil
         removeFirstPointMarker()
+        removeMeasurementPreview()
     }
 
     /// Desactiva el modo medición.
@@ -235,6 +253,8 @@ final class ARSceneManager: NSObject {
         isMeasurementMode = false
         measurementFirstPoint = nil
         removeFirstPointMarker()
+        removeMeasurementPreview()
+        stopMeasurementPreviewUpdates()
     }
 
     /// Registra un punto en la escena AR. Aplica snap a bordes/esquinas si está habilitado.
@@ -244,6 +264,9 @@ final class ARSceneManager: NSObject {
         let snappedPosition = snapToEdgesEnabled ? snapToNearestEdgeOrCorner(position) : position
         
         if let first = measurementFirstPoint {
+            // Segundo punto: crear medición definitiva
+            stopMeasurementPreviewUpdates()
+            removeMeasurementPreview()
             removeFirstPointMarker()
             removeSnapMarker()
             let distance = simd_distance(first, snappedPosition)
@@ -254,6 +277,8 @@ final class ARSceneManager: NSObject {
         } else {
             measurementFirstPoint = snappedPosition
             showFirstPointMarker(at: snappedPosition)
+            // Iniciar preview en tiempo real de la línea de medición
+            startMeasurementPreviewUpdates()
         }
     }
     
@@ -404,7 +429,119 @@ final class ARSceneManager: NSObject {
         measurementFirstPointMarker = nil
     }
 
-    /// Añade a la escena la línea, etiqueta justo encima de la línea y esferas en los extremos.
+    // MARK: - Preview de medición en tiempo real
+    
+    /// Inicia el timer que actualiza la línea de preview cada ~30fps mientras el usuario apunta.
+    private func startMeasurementPreviewUpdates() {
+        stopMeasurementPreviewUpdates()
+        measurementPreviewTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 30.0, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                self?.updateMeasurementPreview()
+            }
+        }
+    }
+    
+    /// Para el timer de preview.
+    private func stopMeasurementPreviewUpdates() {
+        measurementPreviewTimer?.invalidate()
+        measurementPreviewTimer = nil
+    }
+    
+    /// Actualiza la línea temporal que va desde el primer punto hasta donde apunta la cámara.
+    private func updateMeasurementPreview() {
+        guard isMeasurementMode,
+              let firstPoint = measurementFirstPoint,
+              let sceneView = sceneView,
+              let frame = sceneView.session.currentFrame else {
+            removeMeasurementPreview()
+            return
+        }
+        
+        // Raycast desde el centro de la pantalla
+        let center = CGPoint(x: sceneView.bounds.midX, y: sceneView.bounds.midY)
+        var currentTarget: SIMD3<Float>?
+        
+        if let query = sceneView.raycastQuery(from: center, allowing: .existingPlaneGeometry, alignment: .any),
+           let result = sceneView.session.raycast(query).first {
+            currentTarget = result.worldTransform.position
+        } else if let query = sceneView.raycastQuery(from: center, allowing: .estimatedPlane, alignment: .any),
+                  let result = sceneView.session.raycast(query).first {
+            currentTarget = result.worldTransform.position
+        }
+        
+        guard let target = currentTarget else {
+            removeMeasurementPreview()
+            return
+        }
+        
+        let snappedTarget = snapToEdgesEnabled ? snapToNearestEdgeOrCorner(target) : target
+        let distance = simd_distance(firstPoint, snappedTarget)
+        
+        // Eliminar preview anterior
+        removeMeasurementPreview()
+        
+        // Crear nodo con línea punteada + etiqueta de distancia
+        let parent = SCNNode()
+        parent.name = "measurement_preview"
+        
+        let mid = (firstPoint + snappedTarget) * 0.5
+        parent.position = SCNVector3(mid.x, mid.y, mid.z)
+        
+        // Línea (cilindro delgado, semitransparente)
+        let dir = simd_normalize(snappedTarget - firstPoint)
+        let worldUp = SIMD3<Float>(0, 1, 0)
+        var axis = simd_cross(worldUp, dir)
+        if simd_length(axis) < AppConstants.AR.minNormalLength { axis = SIMD3<Float>(1, 0, 0) }
+        axis = simd_normalize(axis)
+        let angle = acos(max(-1, min(1, simd_dot(worldUp, dir))))
+        
+        let cylinder = SCNCylinder(radius: 0.003, height: CGFloat(distance))
+        cylinder.radialSegmentCount = 6
+        cylinder.firstMaterial?.diffuse.contents = UIColor.systemOrange.withAlphaComponent(0.6)
+        cylinder.firstMaterial?.emission.contents = UIColor.orange.withAlphaComponent(0.15)
+        let lineNode = SCNNode(geometry: cylinder)
+        lineNode.rotation = SCNVector4(axis.x, axis.y, axis.z, angle)
+        parent.addChildNode(lineNode)
+        
+        // Etiqueta de distancia
+        let labelString = measurementUnit.format(distanceMeters: distance)
+        let text = SCNText(string: labelString, extrusionDepth: 0.004)
+        text.font = .systemFont(ofSize: 0.05, weight: .bold)
+        text.firstMaterial?.diffuse.contents = UIColor.systemOrange
+        text.firstMaterial?.emission.contents = UIColor.orange.withAlphaComponent(0.3)
+        text.firstMaterial?.isDoubleSided = true
+        let textNode = SCNNode(geometry: text)
+        let s: Float = 0.3
+        textNode.scale = SCNVector3(s, s, s)
+        textNode.position = SCNVector3(0, 0.06, 0)
+        let billboard = SCNBillboardConstraint()
+        billboard.freeAxes = .Y
+        textNode.constraints = [billboard]
+        parent.addChildNode(textNode)
+        
+        // Esfera en el punto objetivo (visual feedback)
+        let targetSphere = SCNSphere(radius: 0.012)
+        targetSphere.firstMaterial?.diffuse.contents = UIColor.systemOrange.withAlphaComponent(0.5)
+        targetSphere.firstMaterial?.emission.contents = UIColor.orange.withAlphaComponent(0.2)
+        let targetNode = SCNNode(geometry: targetSphere)
+        targetNode.position = SCNVector3(
+            snappedTarget.x - mid.x,
+            snappedTarget.y - mid.y,
+            snappedTarget.z - mid.z
+        )
+        parent.addChildNode(targetNode)
+        
+        sceneView.scene.rootNode.addChildNode(parent)
+        measurementPreviewNode = parent
+    }
+    
+    /// Elimina el nodo de preview temporal.
+    private func removeMeasurementPreview() {
+        measurementPreviewNode?.removeFromParentNode()
+        measurementPreviewNode = nil
+    }
+
+    /// Añade a la escena la línea, etiqueta y esferas. Usa simdWorldPosition para estabilidad.
     private func addMeasurementDisplay(measurement: ARMeasurement) {
         guard let sceneView = sceneView else { return }
         let pointA = measurement.pointA
@@ -413,55 +550,80 @@ final class ARSceneManager: NSObject {
         let parent = SCNNode()
         parent.name = "measurement_\(measurement.id.uuidString)"
         let mid = (pointA + pointB) * 0.5
-        parent.position = SCNVector3(mid.x, mid.y, mid.z)
+        parent.simdWorldPosition = mid
+        
         let length = distance
         let dir = simd_normalize(pointB - pointA)
         let worldUp = SIMD3<Float>(0, 1, 0)
         var axis = simd_cross(worldUp, dir)
         if simd_length(axis) < AppConstants.AR.minNormalLength { axis = SIMD3<Float>(1, 0, 0) }
         axis = simd_normalize(axis)
-        let angle = acos(simd_dot(worldUp, dir))
+        let angle = acos(max(-1, min(1, simd_dot(worldUp, dir))))
 
         let cylinder = SCNCylinder(radius: AppConstants.AR.measurementLineRadius, height: CGFloat(length))
         cylinder.radialSegmentCount = AppConstants.AR.lineRadialSegments
         cylinder.firstMaterial?.diffuse.contents = UIColor.systemGreen
-        cylinder.firstMaterial?.emission.contents = UIColor.green.withAlphaComponent(0.2)
+        cylinder.firstMaterial?.emission.contents = UIColor.green.withAlphaComponent(0.3)
+        cylinder.firstMaterial?.lightingModel = .constant
         let lineNode = SCNNode(geometry: cylinder)
         lineNode.position = SCNVector3(0, 0, 0)
         lineNode.rotation = SCNVector4(axis.x, axis.y, axis.z, angle)
         parent.addChildNode(lineNode)
 
+        // Etiqueta de distancia — SIEMPRE encima del punto medio (offset en Y global)
         let labelString = measurementUnit.format(distanceMeters: distance)
         let text = SCNText(string: labelString, extrusionDepth: AppConstants.AR.measurementTextExtrusion)
-        text.font = .systemFont(ofSize: AppConstants.AR.measurementTextFontSize, weight: .semibold)
+        text.font = .systemFont(ofSize: AppConstants.AR.measurementTextFontSize, weight: .bold)
         text.firstMaterial?.diffuse.contents = UIColor.white
-        text.firstMaterial?.emission.contents = UIColor.darkGray
+        text.firstMaterial?.emission.contents = UIColor.white.withAlphaComponent(0.8)
+        text.firstMaterial?.lightingModel = .constant
         text.firstMaterial?.isDoubleSided = true
+        text.flatness = 0.1
         let textNode = SCNNode(geometry: text)
         let s = AppConstants.AR.measurementTextScale
         textNode.scale = SCNVector3(s, s, s)
-        let aboveLine = simd_cross(dir, worldUp)
-        let aboveNorm = simd_length(aboveLine) > AppConstants.AR.minNormalLength ? simd_normalize(aboveLine) : SIMD3<Float>(1, 0, 0)
-        let offset = AppConstants.AR.measurementTextOffset
-        textNode.position = SCNVector3(aboveNorm.x * offset, aboveNorm.y * offset, aboveNorm.z * offset)
+        // Centrar texto horizontalmente
+        let (textMin, textMax) = textNode.boundingBox
+        let textWidth = (textMax.x - textMin.x) * s
+        let textHeight = (textMax.y - textMin.y) * s
+        // Offset SIEMPRE en Y positivo (arriba), fijo e independiente de la dirección de la línea
+        let yOffset = AppConstants.AR.measurementTextOffset
+        textNode.position = SCNVector3(-textWidth / 2, yOffset, 0)
         let billboard = SCNBillboardConstraint()
-        billboard.freeAxes = .Y
+        billboard.freeAxes = [.X, .Y]
         textNode.constraints = [billboard]
         parent.addChildNode(textNode)
+        
+        // Fondo semitransparente detrás del texto para legibilidad
+        let bgWidth = CGFloat(textWidth + 0.02)
+        let bgHeight = CGFloat(textHeight + 0.01)
+        let bgPlane = SCNPlane(width: bgWidth, height: bgHeight)
+        bgPlane.firstMaterial?.diffuse.contents = UIColor.black.withAlphaComponent(0.5)
+        bgPlane.firstMaterial?.lightingModel = .constant
+        bgPlane.firstMaterial?.isDoubleSided = true
+        let bgNode = SCNNode(geometry: bgPlane)
+        bgNode.position = SCNVector3(0, yOffset + Float(bgHeight) / 2, -0.001)
+        bgNode.constraints = [billboard]
+        parent.addChildNode(bgNode)
 
+        // Esferas en extremos (con emisión para que se vean siempre)
         let sphereGeo = SCNSphere(radius: AppConstants.AR.measurementEndpointRadius)
         sphereGeo.firstMaterial?.diffuse.contents = UIColor.systemGreen
-        sphereGeo.firstMaterial?.emission.contents = UIColor.green.withAlphaComponent(0.2)
+        sphereGeo.firstMaterial?.emission.contents = UIColor.green.withAlphaComponent(0.5)
+        sphereGeo.firstMaterial?.lightingModel = .constant
         let sphereA = SCNNode(geometry: sphereGeo)
-        sphereA.position = SCNVector3((pointA.x - mid.x), (pointA.y - mid.y), (pointA.z - mid.z))
+        sphereA.simdPosition = pointA - mid
         parent.addChildNode(sphereA)
         let sphereGeoB = SCNSphere(radius: AppConstants.AR.measurementEndpointRadius)
         sphereGeoB.firstMaterial?.diffuse.contents = UIColor.systemGreen
-        sphereGeoB.firstMaterial?.emission.contents = UIColor.green.withAlphaComponent(0.2)
+        sphereGeoB.firstMaterial?.emission.contents = UIColor.green.withAlphaComponent(0.5)
+        sphereGeoB.firstMaterial?.lightingModel = .constant
         let sphereB = SCNNode(geometry: sphereGeoB)
-        sphereB.position = SCNVector3((pointB.x - mid.x), (pointB.y - mid.y), (pointB.z - mid.z))
+        sphereB.simdPosition = pointB - mid
         parent.addChildNode(sphereB)
 
+        // Renderizar mediciones encima de otros elementos para que no se oculten
+        parent.renderingOrder = 10
         sceneView.scene.rootNode.addChildNode(parent)
         measurementDisplayNodes[measurement.id] = parent
     }
@@ -706,6 +868,99 @@ final class ARSceneManager: NSObject {
         }
         // Fallback: clasificar por alineación
         return anchor.alignment == .vertical ? .wall : .floor
+    }
+
+    // MARK: - Resumen de habitación
+    
+    /// Calcula dimensiones estimadas de la habitación a partir de los planos detectados.
+    func estimateRoomSummary() -> RoomSummary? {
+        let walls = detectedPlanes.filter { $0.alignment == .vertical }
+        let floors = detectedPlanes.filter { classifyPlane($0) == .floor }
+        let ceilings = detectedPlanes.filter { classifyPlane($0) == .ceiling }
+        
+        guard !walls.isEmpty else { return nil }
+        
+        // Estimar ancho y largo del room:
+        // Usar los dos planos verticales más grandes perpendiculares entre sí
+        var maxWidth: Float = 0
+        var maxLength: Float = 0
+        
+        for wall in walls {
+            let w = wall.extent.x
+            let h = wall.extent.z
+            // El extent.x de un plano vertical es su ancho horizontal
+            maxWidth = max(maxWidth, w)
+            
+            // Buscar un plano perpendicular para el largo
+            let n1 = planeNormal(wall)
+            for other in walls where other.identifier != wall.identifier {
+                let n2 = planeNormal(other)
+                let dot = abs(simd_dot(n1, n2))
+                if dot < 0.3 { // Son ~perpendiculares
+                    maxLength = max(maxLength, other.extent.x)
+                }
+            }
+        }
+        
+        // Si no encontró largo diferente, usar el segundo ancho más grande
+        if maxLength == 0 {
+            let widths = walls.map { $0.extent.x }.sorted(by: >)
+            if widths.count >= 2 {
+                maxLength = widths[1]
+            } else {
+                maxLength = maxWidth
+            }
+        }
+        
+        // Altura: usar el plano vertical más alto, o la distancia suelo-techo
+        var estimatedHeight: Float = walls.map { $0.extent.z }.max() ?? 2.5
+        
+        if let floor = floors.first, let ceiling = ceilings.first {
+            let floorY = floor.transform.columns.3.y
+            let ceilingY = ceiling.transform.columns.3.y
+            estimatedHeight = abs(ceilingY - floorY)
+        }
+        
+        // Asegurar que width >= length para consistencia
+        let finalWidth = max(maxWidth, maxLength)
+        let finalLength = min(maxWidth, maxLength)
+        
+        return RoomSummary(width: finalWidth, length: finalLength, height: estimatedHeight)
+    }
+    
+    // MARK: - Exportar PDF
+    
+    /// Genera un informe PDF profesional con la captura actual de la escena.
+    func generatePDFReport() -> URL? {
+        // Capturar imagen de la escena
+        var sceneImage: UIImage?
+        if let sceneView = sceneView {
+            UIGraphicsBeginImageContextWithOptions(sceneView.bounds.size, false, UIScreen.main.scale)
+            sceneView.drawHierarchy(in: sceneView.bounds, afterScreenUpdates: true)
+            sceneImage = UIGraphicsGetImageFromCurrentImageContext()
+            UIGraphicsEndImageContext()
+        }
+        
+        // Preparar datos de mediciones
+        let measurementData = measurements.enumerated().map { (index, m) in
+            (index: index + 1, distance: m.distance, unit: measurementUnit)
+        }
+        
+        // Preparar datos de planos
+        let planeData = detectedPlanes.map { plane in
+            let classification = classifyPlane(plane)
+            return (classification: classification.displayName, width: plane.extent.x, height: plane.extent.z)
+        }
+        
+        return PDFReportService.generateReport(
+            sceneImage: sceneImage,
+            measurements: measurementData,
+            planes: planeData,
+            corners: detectedCorners.count,
+            frames: placedFrames.count,
+            isLiDAR: isLiDARAvailable,
+            roomSummary: estimateRoomSummary()
+        )
     }
 
     // MARK: - Captura offsite
@@ -988,50 +1243,67 @@ final class ARSceneManager: NSObject {
         return SIMD3<Float>(t.columns.2.x, t.columns.2.y, t.columns.2.z)
     }
 
-    /// Orientación según el plano: en pared (vertical) = cuadro vertical; en techo/suelo (horizontal) = cuadro horizontal (tumbado).
+    /// Orientación según la superficie: pared = perpendicular mirando hacia fuera;
+    /// suelo = mirando hacia arriba; techo = mirando hacia abajo.
     private func orientationForPlane(anchor: ARPlaneAnchor) -> simd_quatf {
         if anchor.alignment == .vertical {
             return orientationForVerticalPlane(anchor: anchor)
         } else {
-            return orientationForHorizontalPlane(anchor: anchor)
+            let classification = classifyPlane(anchor)
+            if classification == .ceiling {
+                return orientationForCeiling(anchor: anchor)
+            } else {
+                return orientationForFloor(anchor: anchor)
+            }
         }
     }
 
-    /// Pared: cuadro vertical (alto, "de pie"), arriba del marco = hacia el techo.
+    /// Pared: cuadro vertical mirando hacia fuera de la pared, con el "arriba" del marco hacia el techo.
     private func orientationForVerticalPlane(anchor: ARPlaneAnchor) -> simd_quatf {
         let t = anchor.transform
-        let N = SIMD3<Float>(t.columns.2.x, t.columns.2.y, t.columns.2.z)
+        // Normal del plano (apunta hacia fuera de la pared)
+        let N = simd_normalize(SIMD3<Float>(t.columns.2.x, t.columns.2.y, t.columns.2.z))
         let worldUp = SIMD3<Float>(0, 1, 0)
-        var U = worldUp - simd_dot(worldUp, N) * N
-        let len = simd_length(U)
+        
+        // Y del cuadro = up (world up proyectado para ser perpendicular a la normal)
+        var upDir = worldUp - simd_dot(worldUp, N) * N
+        let len = simd_length(upDir)
         if len < AppConstants.AR.minNormalLength {
-            U = SIMD3<Float>(0, 1, 0)
+            upDir = SIMD3<Float>(0, 1, 0)
         } else {
-            U = U / len
+            upDir = upDir / len
         }
-        U = -U
-        let R = simd_cross(N, U)
-        let Rnorm = simd_normalize(R)
-        let rot3 = simd_float3x3(U, Rnorm, -N)
-        return simd_quatf(rot3)
+        
+        // X del cuadro = right (perpendicular a up y a la dirección de la cara)
+        let rightDir = simd_normalize(simd_cross(upDir, N))
+        
+        // Matriz: col0=X(right), col1=Y(up), col2=Z(normal=cara del cuadro hacia fuera)
+        let rot = simd_float3x3(rightDir, upDir, N)
+        return simd_quatf(rot)
     }
 
-    /// Techo/suelo: cuadro horizontal (tumbado en el plano), no "de pie".
-    private func orientationForHorizontalPlane(anchor: ARPlaneAnchor) -> simd_quatf {
+    /// Suelo: cuadro horizontal mirando hacia arriba (visible al mirar el suelo desde arriba).
+    private func orientationForFloor(anchor: ARPlaneAnchor) -> simd_quatf {
         let t = anchor.transform
-        let N = SIMD3<Float>(t.columns.2.x, t.columns.2.y, t.columns.2.z)
-        let worldForward = SIMD3<Float>(0, 0, -1)
-        var U = worldForward - simd_dot(worldForward, N) * N
-        let len = simd_length(U)
-        if len < 0.001 {
-            U = SIMD3<Float>(1, 0, 0)
-        } else {
-            U = U / len
-        }
-        let R = simd_cross(N, U)
-        let Rnorm = simd_normalize(R)
-        let rot3 = simd_float3x3(Rnorm, U, -N)
-        return simd_quatf(rot3)
+        // Eje X del plano (dirección horizontal a lo largo de la superficie)
+        let planeRight = simd_normalize(SIMD3<Float>(t.columns.0.x, t.columns.0.y, t.columns.0.z))
+        // Normal del cuadro apunta ARRIBA para que se vea desde arriba
+        let faceDirection = SIMD3<Float>(0, 1, 0)
+        // Eje Y del cuadro (altura) = Z × X (sistema diestro)
+        let frameUp = simd_normalize(simd_cross(faceDirection, planeRight))
+        let rot = simd_float3x3(planeRight, frameUp, faceDirection)
+        return simd_quatf(rot)
+    }
+
+    /// Techo: cuadro horizontal mirando hacia abajo (visible al mirar el techo desde abajo).
+    private func orientationForCeiling(anchor: ARPlaneAnchor) -> simd_quatf {
+        let t = anchor.transform
+        let planeRight = simd_normalize(SIMD3<Float>(t.columns.0.x, t.columns.0.y, t.columns.0.z))
+        // Normal del cuadro apunta ABAJO para que se vea desde abajo
+        let faceDirection = SIMD3<Float>(0, -1, 0)
+        let frameUp = simd_normalize(simd_cross(faceDirection, planeRight))
+        let rot = simd_float3x3(planeRight, frameUp, faceDirection)
+        return simd_quatf(rot)
     }
 
     /// Busca otro plano vertical que forme esquina (~90°) con el dado y esté cerca del punto.
@@ -1054,56 +1326,134 @@ final class ARSceneManager: NSObject {
         return nil
     }
 
-    /// Cuadro plano con foto. Si useFramePerspective=true, se alinea al plano (pared);
-    /// si false, usa billboard constraint clásico.
-    private func createFrameNode(size: CGSize, image: UIImage? = nil) -> SCNNode {
+    /// Cuadro plano con foto. Si alignToSurface=true, se orienta según la superficie (pared/suelo/techo);
+    /// si false, usa billboard constraint para que siempre mire a la cámara.
+    private func createFrameNode(size: CGSize, image: UIImage? = nil, alignToSurface: Bool = false) -> SCNNode {
         let plane = SCNPlane(width: size.width, height: size.height)
         plane.firstMaterial?.diffuse.contents = image ?? UIColor.systemGray5
         plane.firstMaterial?.isDoubleSided = true
-        plane.firstMaterial?.specular.contents = UIColor.white
-        plane.firstMaterial?.lightingModel = .physicallyBased
+        // Lambert muestra la textura/foto fielmente sin necesitar iluminación compleja
+        plane.firstMaterial?.lightingModel = .lambert
+        plane.firstMaterial?.emission.contents = UIColor(white: 0.15, alpha: 1) // Brillo mínimo para que se vea en sombra
         let node = SCNNode(geometry: plane)
         node.name = "frame"
+        node.renderingOrder = 1 // Encima del borde
         
-        // Solo usar billboard si la perspectiva no está habilitada
-        if !useFramePerspective {
+        // Billboard solo cuando NO se alinea a superficie y perspectiva está deshabilitada
+        if !alignToSurface && !useFramePerspective {
             let billboard = SCNBillboardConstraint()
             billboard.freeAxes = .Y
             node.constraints = [billboard]
         }
         
-        // Añadir borde visual al cuadro
+        // Añadir borde visual al cuadro (detrás de la imagen)
         let border = SCNPlane(width: size.width + 0.02, height: size.height + 0.02)
         border.firstMaterial?.diffuse.contents = UIColor.white
         border.firstMaterial?.isDoubleSided = true
+        border.firstMaterial?.lightingModel = .constant
         let borderNode = SCNNode(geometry: border)
-        borderNode.position = SCNVector3(0, 0, -0.001) // Ligeramente detrás
+        borderNode.position = SCNVector3(0, 0, -0.002) // Detrás de la imagen
         borderNode.name = "frame_border"
+        borderNode.renderingOrder = 0 // Detrás de la foto
         node.addChildNode(borderNode)
         
         return node
     }
 
-    /// Cuadro en esquina (dos caras en L); el conjunto siempre se ve de frente (billboard).
+    /// Cuadro en esquina (dos mitades en L), cada una pegada a su pared real.
+    /// NO usa billboard: cada mitad se orienta según la normal de su pared.
     private func createCornerFrameNode(size: CGSize, image: UIImage? = nil, planeA: ARPlaneAnchor, planeB: ARPlaneAnchor) -> (SCNNode, [SCNNode]) {
         let parent = SCNNode()
         parent.name = "frame_corner"
-        let billboard = SCNBillboardConstraint()
-        billboard.freeAxes = .Y
-        parent.constraints = [billboard]
-        let contents = image ?? UIColor.systemGray5
-        let plane1 = SCNPlane(width: size.width, height: size.height)
-        plane1.firstMaterial?.diffuse.contents = contents
+        // SIN billboard — cada mitad se alinea a su pared
+
+        let halfWidth = CGFloat(size.width) / 2.0
+        let contents: Any = image ?? UIColor.systemGray5
+
+        // Calcular tangentes de cada pared (dirección horizontal a lo largo de la pared)
+        let worldUp = SIMD3<Float>(0, 1, 0)
+        let normalA = planeNormal(planeA)
+        let normalB = planeNormal(planeB)
+
+        var tangentA = simd_normalize(simd_cross(worldUp, normalA))
+        if simd_length(tangentA) < AppConstants.AR.minNormalLength {
+            tangentA = SIMD3<Float>(1, 0, 0)
+        }
+        // tangentA debe apuntar alejándose de la pared B (hacia el interior de pared A)
+        if simd_dot(tangentA, normalB) > 0 {
+            tangentA = -tangentA
+        }
+
+        var tangentB = simd_normalize(simd_cross(worldUp, normalB))
+        if simd_length(tangentB) < AppConstants.AR.minNormalLength {
+            tangentB = SIMD3<Float>(0, 0, 1)
+        }
+        // tangentB debe apuntar alejándose de la pared A
+        if simd_dot(tangentB, normalA) > 0 {
+            tangentB = -tangentB
+        }
+
+        // === Dividir imagen en dos mitades si existe ===
+        var contentsA: Any = contents
+        var contentsB: Any = contents
+        if let img = image, let cgImg = img.cgImage {
+            let pixelW = cgImg.width
+            let pixelH = cgImg.height
+            let leftRect = CGRect(x: 0, y: 0, width: pixelW / 2, height: pixelH)
+            let rightRect = CGRect(x: pixelW / 2, y: 0, width: pixelW - pixelW / 2, height: pixelH)
+            if let cgLeft = cgImg.cropping(to: leftRect) {
+                contentsA = UIImage(cgImage: cgLeft)
+            }
+            if let cgRight = cgImg.cropping(to: rightRect) {
+                contentsB = UIImage(cgImage: cgRight)
+            }
+        }
+
+        // --- Mitad A (pared A) ---
+        let plane1 = SCNPlane(width: halfWidth, height: size.height)
+        plane1.firstMaterial?.diffuse.contents = contentsA
         plane1.firstMaterial?.isDoubleSided = true
-        plane1.firstMaterial?.specular.contents = UIColor.white
+        plane1.firstMaterial?.lightingModel = .lambert
+        plane1.firstMaterial?.emission.contents = UIColor(white: 0.15, alpha: 1)
         let node1 = SCNNode(geometry: plane1)
-        node1.simdOrientation = orientationForPlane(anchor: planeA)
-        let plane2 = SCNPlane(width: size.width, height: size.height)
-        plane2.firstMaterial?.diffuse.contents = contents
+        node1.simdOrientation = orientationForVerticalPlane(anchor: planeA)
+        // Centrar la mitad a lo largo de su pared, ligeramente fuera de la superficie
+        node1.simdPosition = tangentA * Float(halfWidth) / 2.0 + normalA * 0.005
+        node1.name = "frame_half_A"
+        node1.renderingOrder = 1
+
+        let border1 = SCNPlane(width: halfWidth + 0.015, height: size.height + 0.015)
+        border1.firstMaterial?.diffuse.contents = UIColor.white
+        border1.firstMaterial?.isDoubleSided = true
+        border1.firstMaterial?.lightingModel = .constant
+        let borderNode1 = SCNNode(geometry: border1)
+        borderNode1.position = SCNVector3(0, 0, -0.002)
+        borderNode1.name = "frame_border"
+        borderNode1.renderingOrder = 0
+        node1.addChildNode(borderNode1)
+
+        // --- Mitad B (pared B) ---
+        let plane2 = SCNPlane(width: halfWidth, height: size.height)
+        plane2.firstMaterial?.diffuse.contents = contentsB
         plane2.firstMaterial?.isDoubleSided = true
-        plane2.firstMaterial?.specular.contents = UIColor.white
+        plane2.firstMaterial?.lightingModel = .lambert
+        plane2.firstMaterial?.emission.contents = UIColor(white: 0.15, alpha: 1)
         let node2 = SCNNode(geometry: plane2)
-        node2.simdOrientation = orientationForPlane(anchor: planeB)
+        node2.simdOrientation = orientationForVerticalPlane(anchor: planeB)
+        node2.simdPosition = tangentB * Float(halfWidth) / 2.0 + normalB * 0.005
+        node2.name = "frame_half_B"
+        node2.renderingOrder = 1
+
+        let border2 = SCNPlane(width: halfWidth + 0.015, height: size.height + 0.015)
+        border2.firstMaterial?.diffuse.contents = UIColor.white
+        border2.firstMaterial?.isDoubleSided = true
+        border2.firstMaterial?.lightingModel = .constant
+        let borderNode2 = SCNNode(geometry: border2)
+        borderNode2.position = SCNVector3(0, 0, -0.002)
+        borderNode2.name = "frame_border"
+        borderNode2.renderingOrder = 0
+        node2.addChildNode(borderNode2)
+
         parent.addChildNode(node1)
         parent.addChildNode(node2)
         return (parent, [node1, node2])
@@ -1111,12 +1461,26 @@ final class ARSceneManager: NSObject {
 
     /// Aplica imagen al nodo (una geometría o dos hijos en esquina).
     private func applyImage(to node: SCNNode, image: UIImage?, size: CGSize, isCorner: Bool) {
-        let contents = image ?? UIColor.systemGray5
+        let contents: Any = image ?? UIColor.systemGray5
         if isCorner {
+            // Dividir imagen en mitades para esquina
+            var contentsA: Any = contents
+            var contentsB: Any = contents
+            if let img = image, let cgImg = img.cgImage {
+                let pixelW = cgImg.width
+                let pixelH = cgImg.height
+                let leftRect = CGRect(x: 0, y: 0, width: pixelW / 2, height: pixelH)
+                let rightRect = CGRect(x: pixelW / 2, y: 0, width: pixelW - pixelW / 2, height: pixelH)
+                if let cgLeft = cgImg.cropping(to: leftRect) { contentsA = UIImage(cgImage: cgLeft) }
+                if let cgRight = cgImg.cropping(to: rightRect) { contentsB = UIImage(cgImage: cgRight) }
+            }
+            let halfWidth = CGFloat(size.width) / 2.0
+            // Solo aplicar a nodos frame_half, no a bordes
             for child in node.childNodes {
+                guard child.name == "frame_half_A" || child.name == "frame_half_B" else { continue }
                 if let plane = child.geometry as? SCNPlane {
-                    plane.firstMaterial?.diffuse.contents = contents
-                    plane.width = size.width
+                    plane.firstMaterial?.diffuse.contents = (child.name == "frame_half_A") ? contentsA : contentsB
+                    plane.width = halfWidth
                     plane.height = size.height
                 }
             }

@@ -67,9 +67,8 @@ final class StorageService: StorageServiceProtocol, @unchecked Sendable {
     }
 
     var capturesDirectory: URL {
-        guard let docs = fileManager.urls(for: .documentDirectory, in: .userDomainMask).first else {
-            fatalError("Cannot access Documents directory")
-        }
+        let docs = fileManager.urls(for: .documentDirectory, in: .userDomainMask).first
+            ?? FileManager.default.temporaryDirectory
         return docs.appendingPathComponent(AppConstants.Capture.directoryName, isDirectory: true)
     }
 

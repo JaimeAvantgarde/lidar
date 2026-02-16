@@ -30,6 +30,7 @@ struct ARViewRepresentable: UIViewControllerRepresentable {
 final class ARViewController: UIViewController {
     var sceneManager: ARSceneManager?
     private var arView: ARSCNView?
+    private var coachingOverlay: ARCoachingOverlayView?
     private var currentScale: CGFloat = 1.0
     var arViewInteractionEnabled: Bool = true
     
@@ -43,6 +44,22 @@ final class ARViewController: UIViewController {
         arSCNView.debugOptions = []
         view.addSubview(arSCNView)
         self.arView = arSCNView
+
+        // Coaching overlay — guía visual de Apple para AR
+        let coaching = ARCoachingOverlayView()
+        coaching.session = arSCNView.session
+        coaching.delegate = self
+        coaching.goal = .horizontalPlane
+        coaching.activatesAutomatically = true
+        coaching.translatesAutoresizingMaskIntoConstraints = false
+        arSCNView.addSubview(coaching)
+        NSLayoutConstraint.activate([
+            coaching.topAnchor.constraint(equalTo: arSCNView.topAnchor),
+            coaching.leadingAnchor.constraint(equalTo: arSCNView.leadingAnchor),
+            coaching.trailingAnchor.constraint(equalTo: arSCNView.trailingAnchor),
+            coaching.bottomAnchor.constraint(equalTo: arSCNView.bottomAnchor)
+        ])
+        self.coachingOverlay = coaching
 
         sceneManager.setSceneView(arSCNView)
         sceneManager.startSession()
@@ -155,6 +172,20 @@ extension ARViewController: UIGestureRecognizerDelegate {
             return false
         }
         return true
+    }
+}
+
+// MARK: - AR Coaching Overlay Delegate
+
+extension ARViewController: ARCoachingOverlayViewDelegate {
+    func coachingOverlayViewWillActivate(_ coachingOverlayView: ARCoachingOverlayView) {
+        // Ocultar UI mientras se muestra la guía
+        arViewInteractionEnabled = false
+    }
+    
+    func coachingOverlayViewDidDeactivate(_ coachingOverlayView: ARCoachingOverlayView) {
+        // Restaurar interacción cuando el tracking es bueno
+        arViewInteractionEnabled = true
     }
 }
 

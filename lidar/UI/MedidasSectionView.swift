@@ -9,11 +9,16 @@ import SwiftUI
 
 struct MedidasSectionView: View {
     var sceneManager: ARSceneManager
+    @State private var showShareSheet = false
+    @State private var pdfURL: URL?
+    @State private var isGeneratingPDF = false
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
                 headerBlock
+                // Resumen de habitación
+                roomSummaryBlock
                 if sceneManager.isMeasurementMode {
                     measurementModeBlock
                 } else {
@@ -26,11 +31,18 @@ struct MedidasSectionView: View {
                 if let result = sceneManager.lastMeasurementResult, sceneManager.measurements.count == 1 {
                     lastMeasurementSummary
                 }
+                // Exportar PDF
+                exportPDFBlock
             }
             .padding(.horizontal)
         }
         .navigationTitle("Medidas")
         .navigationBarTitleDisplayMode(.inline)
+        .sheet(isPresented: $showShareSheet) {
+            if let url = pdfURL {
+                ShareSheet(activityItems: [url])
+            }
+        }
     }
 
     private var headerBlock: some View {
@@ -194,4 +206,137 @@ struct MedidasSectionView: View {
             }
         }
     }
+
+    // MARK: - Resumen de habitación
+
+    private var roomSummaryBlock: some View {
+        Group {
+            if let room = sceneManager.estimateRoomSummary() {
+                VStack(alignment: .leading, spacing: 10) {
+                    Label("Dimensiones estimadas", systemImage: "house.fill")
+                        .font(.subheadline)
+                        .fontWeight(.semibold)
+                        .foregroundStyle(.blue)
+                    
+                    HStack(spacing: 16) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Ancho")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                            Text(String(format: "%.1f m", room.width))
+                                .font(.callout)
+                                .fontWeight(.bold)
+                                .monospacedDigit()
+                        }
+                        
+                        Text("×")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Largo")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                            Text(String(format: "%.1f m", room.length))
+                                .font(.callout)
+                                .fontWeight(.bold)
+                                .monospacedDigit()
+                        }
+                        
+                        Text("×")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Alto")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                            Text(String(format: "%.1f m", room.height))
+                                .font(.callout)
+                                .fontWeight(.bold)
+                                .monospacedDigit()
+                        }
+                        
+                        Spacer()
+                        
+                        VStack(alignment: .trailing, spacing: 2) {
+                            Text(String(format: "%.1f m²", room.area))
+                                .font(.callout)
+                                .fontWeight(.bold)
+                                .foregroundStyle(.blue)
+                            Text(String(format: "%.1f m³", room.volume))
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+                .padding()
+                .glassBackground(cornerRadius: 16)
+            }
+        }
+    }
+
+    // MARK: - Exportar PDF
+
+    private var exportPDFBlock: some View {
+        VStack(spacing: 12) {
+            Button {
+                isGeneratingPDF = true
+                // Pequeño delay para que la UI muestre el loading
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                    pdfURL = sceneManager.generatePDFReport()
+                    isGeneratingPDF = false
+                    if pdfURL != nil {
+                        showShareSheet = true
+                        HapticService.shared.notification(type: .success)
+                    } else {
+                        HapticService.shared.notification(type: .error)
+                    }
+                }
+            } label: {
+                HStack(spacing: 8) {
+                    if isGeneratingPDF {
+                        ProgressView()
+                            .tint(.white)
+                    } else {
+                        Image(systemName: "doc.richtext")
+                    }
+                    Text(isGeneratingPDF ? "Generando informe..." : "Exportar informe PDF")
+                        .fontWeight(.semibold)
+                }
+                .font(.subheadline)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 12)
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(.blue)
+            .disabled(isGeneratingPDF || !hasDataToExport)
+            .opacity(hasDataToExport ? 1.0 : 0.5)
+            
+            if !hasDataToExport {
+                Text("Necesitas al menos una medición o superficie detectada para generar el informe")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+            }
+        }
+        .padding()
+        .glassBackground(cornerRadius: 16)
+    }
+    
+    private var hasDataToExport: Bool {
+        !sceneManager.measurements.isEmpty || !sceneManager.detectedPlanes.isEmpty
+    }
+}
+
+// MARK: - ShareSheet UIKit wrapper
+
+struct ShareSheet: UIViewControllerRepresentable {
+    let activityItems: [Any]
+    
+    func makeUIViewController(context: Context) -> UIActivityViewController {
+        UIActivityViewController(activityItems: activityItems, applicationActivities: nil)
+    }
+    
+    func updateUIViewController(_ uiViewController: UIActivityViewController, context: Context) {}
 }
