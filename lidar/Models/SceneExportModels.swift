@@ -238,14 +238,16 @@ struct OffsiteFramePerspective: Codable, Identifiable, Equatable, Hashable {
     /// Dimensiones reales en metros
     var widthMeters: Double
     var heightMeters: Double
-    /// Imagen en base64
+    /// Imagen en base64 (legacy)
     var imageBase64: String?
+    /// Nombre del archivo de imagen separado
+    var imageFilename: String?
     /// Label del cuadro
     var label: String?
     /// Color del borde
     var color: String
-    
-    init(id: UUID = UUID(), planeId: String? = nil, center2D: NormalizedPoint, corners2D: [[Double]], widthMeters: Double, heightMeters: Double, imageBase64: String? = nil, label: String? = nil, color: String = "#3B82F6") {
+
+    init(id: UUID = UUID(), planeId: String? = nil, center2D: NormalizedPoint, corners2D: [[Double]], widthMeters: Double, heightMeters: Double, imageBase64: String? = nil, imageFilename: String? = nil, label: String? = nil, color: String = "#3B82F6") {
         self.id = id
         self.planeId = planeId
         self.center2D = center2D
@@ -253,6 +255,7 @@ struct OffsiteFramePerspective: Codable, Identifiable, Equatable, Hashable {
         self.widthMeters = widthMeters
         self.heightMeters = heightMeters
         self.imageBase64 = imageBase64
+        self.imageFilename = imageFilename
         self.label = label
         self.color = color
     }
@@ -287,14 +290,28 @@ struct OffsiteSceneSnapshot: Codable, Equatable {
     /// Última modificación
     var lastModified: Date?
     
-    /// Escala metros/pixel calculada a partir de las mediciones AR
+    /// Escala metros/pixel calculada promediando TODAS las mediciones AR.
+    /// Convierte coordenadas normalizadas a pixeles reales (usando camera.imageWidth/Height)
+    /// para respetar el aspect ratio antes de calcular.
     var metersPerPixelScale: Double? {
-        guard let arMeasurement = measurements.first(where: { $0.isFromAR }) else { return nil }
-        let dx = arMeasurement.pointB.x - arMeasurement.pointA.x
-        let dy = arMeasurement.pointB.y - arMeasurement.pointA.y
-        let normalizedDistance = sqrt(dx * dx + dy * dy)
-        guard normalizedDistance > 0.001 else { return nil }
-        return arMeasurement.distanceMeters / normalizedDistance
+        let arMeasurements = measurements.filter { $0.isFromAR }
+        guard !arMeasurements.isEmpty else { return nil }
+        let imgW = Double(camera?.imageWidth ?? 0)
+        let imgH = Double(camera?.imageHeight ?? 0)
+        guard imgW > 0, imgH > 0 else { return nil }
+
+        var totalScale = 0.0
+        var validCount = 0
+        for m in arMeasurements {
+            let pixelDx = (m.pointB.x - m.pointA.x) * imgW
+            let pixelDy = (m.pointB.y - m.pointA.y) * imgH
+            let pixelDist = sqrt(pixelDx * pixelDx + pixelDy * pixelDy)
+            guard pixelDist > 1.0 else { continue }
+            totalScale += m.distanceMeters / pixelDist
+            validCount += 1
+        }
+        guard validCount > 0 else { return nil }
+        return totalScale / Double(validCount)
     }
     
     /// Planos verticales (paredes)

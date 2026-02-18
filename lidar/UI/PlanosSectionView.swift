@@ -137,6 +137,34 @@ struct PlanosSectionView: View {
                 .toggleStyle(.switch)
                 .tint(.purple)
             }
+
+            if sceneManager.isLiDARAvailable {
+                Divider()
+
+                HStack(spacing: 12) {
+                    Toggle(isOn: Binding(
+                        get: { sceneManager.showMeshWireframe },
+                        set: { sceneManager.showMeshWireframe = $0; sceneManager.updateMeshVisibility() }
+                    )) {
+                        Label("Malla 3D", systemImage: "line.3.crossed.swirl.circle")
+                            .font(.subheadline)
+                    }
+                    .toggleStyle(.switch)
+                    .tint(.cyan)
+                }
+            }
+
+            HStack(spacing: 12) {
+                Toggle(isOn: Binding(
+                    get: { sceneManager.showFeaturePoints },
+                    set: { sceneManager.showFeaturePoints = $0; sceneManager.updateFeaturePointsVisibility() }
+                )) {
+                    Label("Puntos de tracking", systemImage: "sparkles")
+                        .font(.subheadline)
+                }
+                .toggleStyle(.switch)
+                .tint(.orange)
+            }
         }
         .padding()
         .glassBackground(cornerRadius: 16)

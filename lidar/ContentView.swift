@@ -74,7 +74,7 @@ struct ContentView: View {
             }
 
             // Hint flotante cuando el panel está colapsado, modo mover o modo medidas
-            if !panelExpanded || sceneManager.moveModeForFrameId != nil || sceneManager.isMeasurementMode {
+            if !panelExpanded || sceneManager.moveModeForFrameId != nil || sceneManager.isMeasurementMode || sceneManager.isVinylMode {
                 floatingHint
             }
         }
@@ -395,6 +395,9 @@ struct ContentView: View {
         }
         if sceneManager.moveModeForFrameId != nil {
             return "Toca un plano para colocar el cuadro aquí"
+        }
+        if sceneManager.isVinylMode {
+            return "Toca una pared para cubrir con vinilo"
         }
         if sceneManager.useFramePerspective {
             return "Toca una pared para colocar con perspectiva"

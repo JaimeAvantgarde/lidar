@@ -40,15 +40,14 @@ struct OffsiteCapturesListView: View {
                                             .foregroundStyle(.secondary)
                                         
                                         // Mostrar información de contenido
-                                        if let dataURL = entry.jsonURL.path as? String,
-                                           let captureData = loadCaptureDataPreview(from: entry.jsonURL) {
+                                        if let preview = viewModel.preview(for: entry) {
                                             HStack(spacing: 8) {
-                                                if captureData.measurements.count > 0 {
-                                                    Label("\(captureData.measurements.count)", systemImage: "ruler")
+                                                if preview.measurementCount > 0 {
+                                                    Label("\(preview.measurementCount)", systemImage: "ruler")
                                                         .font(.caption2)
                                                 }
-                                                if captureData.frames.count > 0 {
-                                                    Label("\(captureData.frames.count)", systemImage: "photo.artframe")
+                                                if preview.frameCount > 0 {
+                                                    Label("\(preview.frameCount)", systemImage: "photo.artframe")
                                                         .font(.caption2)
                                                 }
                                             }
@@ -83,22 +82,18 @@ struct OffsiteCapturesListView: View {
         }
     }
     
-    private func loadCaptureDataPreview(from url: URL) -> OffsiteCaptureData? {
-        guard let data = try? Data(contentsOf: url) else { return nil }
-        let decoder = JSONDecoder()
-        decoder.dateDecodingStrategy = .iso8601
-        return try? decoder.decode(OffsiteCaptureData.self, from: data)
-    }
 
     private func thumbnail(for entry: OffsiteCaptureEntry) -> some View {
         Group {
             let thumbURL = viewModel.thumbnailURL(for: entry)
-            
+            let thumbSize = CGSize(width: 112, height: 112) // 56pt * 2x
+
             if let img = UIImage(contentsOfFile: thumbURL.path) {
                 Image(uiImage: img)
                     .resizable()
                     .aspectRatio(contentMode: .fill)
-            } else if let img = UIImage(contentsOfFile: entry.imageURL.path) {
+            } else if let img = UIImage(contentsOfFile: entry.imageURL.path)?
+                .preparingThumbnail(of: thumbSize) {
                 Image(uiImage: img)
                     .resizable()
                     .aspectRatio(contentMode: .fill)
@@ -117,86 +112,77 @@ struct OffsiteCapturesListView: View {
 /// Vista detalle: imagen con líneas y etiquetas de mediciones superpuestas + modo edición.
 struct OffsiteCaptureDetailView: View {
     @Environment(\.dismiss) private var dismiss
-    let entry: OffsiteCaptureEntry
-    @State private var image: UIImage?
-    @State private var data: OffsiteCaptureData?
-    @State private var unit: MeasurementUnit = .meters
-    @State private var isEditMode: Bool = false
-    @State private var editTool: EditTool = .none
-    @State private var pendingMeasurementPoint: CGPoint?
-    @State private var pendingMeasurementNormalizedPoint: NormalizedPoint?
-    @State private var pendingFrameStart: CGPoint?
-    @State private var showTextInput: Bool = false
-    @State private var newTextPosition: CGPoint?
-    @State private var pendingTextNormalizedPoint: NormalizedPoint?
-    @State private var newTextContent: String = ""
-    @State private var selectedFrameId: UUID?  // Cuadro seleccionado para editar
-    @State private var showImagePicker = false  // Para cambiar imagen de cuadro
-    @State private var selectedImage: UIImage?  // Imagen seleccionada de galería
-    // MARK: - Scene overlay state
-    @State private var showPlaneOverlays: Bool = true
-    @State private var showCornerMarkers: Bool = true
-    @State private var showWallDimensions: Bool = true
-    @State private var showPerspectiveFrames: Bool = true
+    @State private var viewModel: OffsiteCaptureDetailViewModel
+
+    // MARK: - Local UI State
+    @State private var showImagePicker = false
+    @State private var selectedImage: UIImage?
+    @State private var showPlaneOverlays: Bool = AppConstants.OffsiteEditor.defaultShowPlaneOverlays
+    @State private var showCornerMarkers: Bool = AppConstants.OffsiteEditor.defaultShowCornerMarkers
+    @State private var showWallDimensions: Bool = AppConstants.OffsiteEditor.defaultShowWallDimensions
+    @State private var showPerspectiveFrames: Bool = AppConstants.OffsiteEditor.defaultShowPerspectiveFrames
     @State private var selectedPlaneId: String?
     @State private var overlayOpacity: Double = 1.0
-    
-    enum EditTool {
-        case none, measure, frame, text, placeFrame
+    @State private var showDeleteConfirmation = false
+    @State private var zoomScale: CGFloat = 1.0
+    @State private var lastZoomScale: CGFloat = 1.0
+    @State private var panOffset: CGSize = .zero
+    @State private var lastPanOffset: CGSize = .zero
+
+    init(entry: OffsiteCaptureEntry) {
+        _viewModel = State(initialValue: OffsiteCaptureDetailViewModel(entry: entry))
     }
 
     var body: some View {
         GeometryReader { fullGeo in
             ZStack {
                 Color.black.ignoresSafeArea()
-                
-                if let image = image {
+
+                if let image = viewModel.image {
                     ZStack(alignment: .topLeading) {
                         Image(uiImage: image)
                             .resizable()
                             .aspectRatio(contentMode: .fit)
                             .frame(maxWidth: .infinity, maxHeight: .infinity)
-                        if let data = data {
+                        if let data = viewModel.data {
                             overlaysView(data: data, viewSize: fullGeo.size, imageSize: image.size)
                         }
                     }
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .scaleEffect(zoomScale)
+                    .offset(panOffset)
                     .contentShape(Rectangle())
-                    .gesture(
-                        DragGesture(minimumDistance: 0)
-                            .onEnded { value in
-                                if isEditMode {
-                                    handleEditTap(at: value.location, viewSize: fullGeo.size, imageSize: image.size)
-                                }
-                            }
-                    )
+                    .gesture(editGesture(viewSize: fullGeo.size, imageSize: image.size))
+                    .gesture(zoomGesture)
+                    .gesture(panGesture)
+                    .onTapGesture(count: 2) { resetZoom() }
                 } else {
-                    ProgressView("Cargando…")
+                    ProgressView("Cargando\u{2026}")
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
             }
         }
         .ignoresSafeArea()
-        .statusBarHidden(isEditMode)
-        .persistentSystemOverlays(isEditMode ? .hidden : .automatic)
+        .statusBarHidden(viewModel.isEditMode)
+        .persistentSystemOverlays(viewModel.isEditMode ? .hidden : .automatic)
         .navigationTitle("")
         .navigationBarTitleDisplayMode(.inline)
-        .navigationBarBackButtonHidden(isEditMode)
-        .toolbar(isEditMode ? .hidden : .visible, for: .navigationBar)
+        .navigationBarBackButtonHidden(viewModel.isEditMode)
+        .toolbar(viewModel.isEditMode ? .hidden : .visible, for: .navigationBar)
         .toolbar {
             ToolbarItem(placement: .cancellationAction) {
-                Button(isEditMode ? "Cancelar" : "Cerrar") {
-                    if isEditMode {
-                        cancelEdit()
+                Button(viewModel.isEditMode ? "Cancelar" : "Cerrar") {
+                    if viewModel.isEditMode {
+                        viewModel.cancelEdit()
                     } else {
                         dismiss()
                     }
                 }
             }
-            
-            if !isEditMode {
+
+            if !viewModel.isEditMode {
                 ToolbarItem(placement: .primaryAction) {
-                    Picker("Unidad", selection: $unit) {
+                    Picker("Unidad", selection: $viewModel.unit) {
                         Text("m").tag(MeasurementUnit.meters)
                         Text("ft").tag(MeasurementUnit.feet)
                     }
@@ -204,109 +190,279 @@ struct OffsiteCaptureDetailView: View {
                     .frame(width: 80)
                     .accessibilityLabel("Unidad de medida")
                 }
-                
-                ToolbarItem(placement: .secondaryAction) {
-                    Menu {
-                        Button {
-                            isEditMode = true
-                        } label: {
-                            Label("Editar", systemImage: "pencil")
-                        }
-                        ShareLink(item: entry.imageURL, preview: SharePreview("Captura \(entry.capturedAt.formatted(date: .abbreviated, time: .shortened))", image: Image(systemName: "photo"))) {
-                            Label("Compartir", systemImage: "square.and.arrow.up")
-                        }
+
+                ToolbarItem(placement: .primaryAction) {
+                    Button {
+                        viewModel.enterEditMode()
                     } label: {
-                        Image(systemName: "ellipsis.circle")
+                        Label("Editar", systemImage: "pencil")
+                    }
+                }
+
+                ToolbarItem(placement: .secondaryAction) {
+                    ShareLink(item: viewModel.entry.imageURL, preview: SharePreview("Captura \(viewModel.entry.capturedAt.formatted(date: .abbreviated, time: .shortened))", image: Image(systemName: "photo"))) {
+                        Label("Compartir", systemImage: "square.and.arrow.up")
                     }
                 }
             } else {
                 ToolbarItem(placement: .primaryAction) {
                     Button("Guardar") {
-                        saveChanges()
+                        viewModel.saveChanges()
                     }
                     .fontWeight(.semibold)
                 }
             }
         }
-            .overlay(alignment: .topLeading) {
-                // Información completa de la escena capturada
-                if !isEditMode {
-                    VStack(alignment: .leading, spacing: 8) {
-                        if let snapshot = data?.sceneSnapshot {
-                            OffsiteSceneInfoPanel(snapshot: snapshot)
-                        } else if let metadata = data?.lidarMetadata {
-                            VStack(alignment: .leading, spacing: 4) {
-                                HStack(spacing: 6) {
-                                    Image(systemName: metadata.isLiDARAvailable ? "sensor.fill" : "sensor")
-                                        .font(.caption)
-                                        .foregroundStyle(metadata.isLiDARAvailable ? .green : .secondary)
-                                    Text(metadata.isLiDARAvailable ? "LiDAR" : "AR")
-                                        .font(.caption2)
-                                        .fontWeight(.medium)
-                                }
-                                if metadata.planeCount > 0 {
-                                    Text("\(metadata.planeCount) planos detectados")
-                                        .font(.caption2)
-                                        .foregroundStyle(.secondary)
-                                }
-                            }
-                            .padding(.horizontal, 12)
-                            .padding(.vertical, 8)
-                            .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12))
+        .overlay(alignment: .topLeading) {
+            if !viewModel.isEditMode {
+                VStack(alignment: .leading, spacing: 8) {
+                    if let snapshot = viewModel.data?.sceneSnapshot {
+                        OffsiteSceneInfoPanel(snapshot: snapshot)
+
+                        // Indicador de escala AR
+                        if snapshot.metersPerPixelScale != nil {
+                            Label("Escala AR disponible", systemImage: "checkmark.seal.fill")
+                                .font(.caption2)
+                                .foregroundStyle(.green)
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 5)
+                                .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 8))
+                        } else if !snapshot.measurements.isEmpty {
+                            Label("Mediciones AR guardadas", systemImage: "ruler")
+                                .font(.caption2)
+                                .foregroundStyle(.cyan)
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 5)
+                                .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 8))
                         }
+                    } else if let metadata = viewModel.data?.lidarMetadata {
+                        VStack(alignment: .leading, spacing: 4) {
+                            HStack(spacing: 6) {
+                                Image(systemName: metadata.isLiDARAvailable ? "sensor.fill" : "sensor")
+                                    .font(.caption)
+                                    .foregroundStyle(metadata.isLiDARAvailable ? .green : .secondary)
+                                Text(metadata.isLiDARAvailable ? "LiDAR" : "AR")
+                                    .font(.caption2)
+                                    .fontWeight(.medium)
+                            }
+                            if metadata.planeCount > 0 {
+                                Text("\(metadata.planeCount) planos detectados")
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 8)
+                        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12))
                     }
-                    .padding(.top, 60)
-                    .padding(.leading, 16)
+                }
+                .padding(.top, 60)
+                .padding(.leading, 16)
+            }
+        }
+        .overlay(alignment: .topTrailing) {
+            if viewModel.isEditMode {
+                editHint
+            }
+        }
+        .overlay(alignment: .bottom) {
+            if viewModel.isEditMode && viewModel.selectedItem != nil {
+                contextActionBar
+                    .padding(.bottom, 200)
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
+            }
+        }
+        .safeAreaInset(edge: .bottom) {
+            if viewModel.isEditMode {
+                editToolbar
+            }
+        }
+        .background(viewModel.isEditMode ? Color.black.opacity(0.3) : Color.clear)
+        .animation(.easeInOut(duration: 0.3), value: viewModel.isEditMode)
+        .animation(.spring(response: 0.3), value: viewModel.selectedItem)
+        .alert("Anadir texto", isPresented: $viewModel.showTextInput) {
+            TextField("Escribe aqui", text: $viewModel.newTextContent)
+            Button("Cancelar", role: .cancel) {
+                viewModel.newTextContent = ""
+            }
+            Button("Anadir") {
+                viewModel.addTextAnnotation()
+            }
+        } message: {
+            Text("Anade una anotacion de texto en esta posicion")
+        }
+        .confirmationDialog(
+            "Eliminar \(viewModel.selectedItemName ?? "elemento")",
+            isPresented: $showDeleteConfirmation,
+            titleVisibility: .visible
+        ) {
+            Button("Eliminar", role: .destructive) {
+                viewModel.deleteSelectedItem()
+            }
+            Button("Cancelar", role: .cancel) {}
+        } message: {
+            Text("Esta accion no se puede deshacer.")
+        }
+        .sheet(isPresented: $showImagePicker) {
+            ImagePicker(selectedImage: $selectedImage)
+        }
+        .onChange(of: selectedImage) { _, newImage in
+            if let image = newImage, let frameId = viewModel.selectedFrameId {
+                viewModel.updateFrameImage(id: frameId, image: image)
+                selectedImage = nil
+                showImagePicker = false
+            }
+        }
+        .onAppear {
+            viewModel.loadContent()
+        }
+    }
+    
+    // MARK: - Gestures
+
+    /// Transforma coordenadas de pantalla compensando zoom y pan.
+    private func adjustedLocation(_ location: CGPoint, viewSize: CGSize) -> CGPoint {
+        let cx = viewSize.width / 2
+        let cy = viewSize.height / 2
+        return CGPoint(
+            x: (location.x - cx - panOffset.width) / zoomScale + cx,
+            y: (location.y - cy - panOffset.height) / zoomScale + cy
+        )
+    }
+
+    private func editGesture(viewSize: CGSize, imageSize: CGSize) -> some Gesture {
+        DragGesture(minimumDistance: 0)
+            .onChanged { value in
+                guard viewModel.isEditMode else { return }
+                if viewModel.editTool == .select {
+                    let dist = sqrt(value.translation.width * value.translation.width + value.translation.height * value.translation.height)
+                    let adjustedStart = adjustedLocation(value.startLocation, viewSize: viewSize)
+                    let adjustedCurrent = adjustedLocation(value.location, viewSize: viewSize)
+                    if !viewModel.isDragging && dist > AppConstants.OffsiteEditor.minDragDistance && viewModel.selectedItem != nil {
+                        viewModel.handleDragStart(at: adjustedStart, viewSize: viewSize, imageSize: imageSize)
+                    }
+                    if viewModel.isDragging {
+                        viewModel.handleDragChanged(to: adjustedCurrent, viewSize: viewSize, imageSize: imageSize)
+                    }
                 }
             }
-            .overlay(alignment: .topTrailing) {
-                if isEditMode && editTool != .none {
-                    editHint
-                }
-            }
-            .safeAreaInset(edge: .bottom) {
-                if isEditMode {
-                    editToolbar
-                }
-            }
-            .background(isEditMode ? Color.black.opacity(0.3) : Color.clear)
-            .animation(.easeInOut(duration: 0.3), value: isEditMode)
-            .alert("Añadir texto", isPresented: $showTextInput) {
-                TextField("Escribe aquí", text: $newTextContent)
-                Button("Cancelar", role: .cancel) {
-                    newTextContent = ""
-                    newTextPosition = nil
-                }
-                Button("Añadir") {
-                    addTextAnnotation()
-                }
-            } message: {
-                Text("Añade una anotación de texto en esta posición")
-            }
-            .sheet(isPresented: $showImagePicker) {
-                ImagePicker(selectedImage: $selectedImage)
-            }
-            .onChange(of: selectedImage) { _, newImage in
-                if let image = newImage, let frameId = selectedFrameId {
-                    updateFrameImage(id: frameId, image: image)
-                    selectedImage = nil
-                    showImagePicker = false
-                }
-            }
-            .onAppear {
-                image = UIImage(contentsOfFile: entry.imageURL.path)
-                loadData()
-            }
-            .onChange(of: data) { _, newData in
-                // Debug: Verificar que los datos se cargaron correctamente
-                if let newData = newData {
-                    print("📊 Captura cargada: \(newData.measurements.count) mediciones, \(newData.frames.count) cuadros")
+            .onEnded { value in
+                guard viewModel.isEditMode else { return }
+                let adjusted = adjustedLocation(value.location, viewSize: viewSize)
+                if viewModel.editTool == .select {
+                    if viewModel.isDragging {
+                        viewModel.handleDragEnded()
+                    } else {
+                        viewModel.handleEditTap(at: adjusted, viewSize: viewSize, imageSize: imageSize)
+                    }
+                } else {
+                    viewModel.handleEditTap(at: adjusted, viewSize: viewSize, imageSize: imageSize)
                 }
             }
     }
-    
+
+    private var zoomGesture: some Gesture {
+        MagnifyGesture()
+            .onChanged { value in
+                let newScale = lastZoomScale * value.magnification
+                zoomScale = min(max(newScale, AppConstants.OffsiteEditor.minZoomScale), AppConstants.OffsiteEditor.maxZoomScale)
+            }
+            .onEnded { _ in
+                lastZoomScale = zoomScale
+            }
+    }
+
+    private var panGesture: some Gesture {
+        DragGesture(minimumDistance: 5)
+            .onChanged { value in
+                guard zoomScale > 1.0, !viewModel.isEditMode else { return }
+                panOffset = CGSize(
+                    width: lastPanOffset.width + value.translation.width,
+                    height: lastPanOffset.height + value.translation.height
+                )
+            }
+            .onEnded { _ in
+                lastPanOffset = panOffset
+            }
+    }
+
+    private func resetZoom() {
+        withAnimation(.spring(response: 0.3)) {
+            zoomScale = 1.0
+            lastZoomScale = 1.0
+            panOffset = .zero
+            lastPanOffset = .zero
+        }
+    }
+
+    // MARK: - Context Action Bar
+
+    private var contextActionBar: some View {
+        HStack(spacing: 12) {
+            Image(systemName: viewModel.selectedItemIcon)
+                .font(.title3)
+                .foregroundStyle(.yellow)
+
+            Text(viewModel.selectedItemName ?? "")
+                .font(.subheadline)
+                .fontWeight(.medium)
+                .foregroundStyle(.white)
+                .lineLimit(1)
+
+            Spacer()
+
+            if viewModel.selectedItemIsFrame {
+                Button {
+                    showImagePicker = true
+                } label: {
+                    Label("Foto", systemImage: "photo")
+                        .font(.subheadline)
+                        .fontWeight(.medium)
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 8)
+                        .background(Color.blue, in: Capsule())
+                }
+            }
+
+            if viewModel.selectedItemSupportsColor {
+                HStack(spacing: 4) {
+                    ForEach(AppConstants.OffsiteEditor.availableColors, id: \.self) { hex in
+                        Circle()
+                            .fill(Color(hex: hex))
+                            .frame(width: 24, height: 24)
+                            .overlay(
+                                viewModel.selectedItemColor == hex
+                                    ? Circle().strokeBorder(Color.white, lineWidth: 2)
+                                    : nil
+                            )
+                            .onTapGesture {
+                                viewModel.updateItemColor(hex)
+                            }
+                    }
+                }
+            }
+
+            Button {
+                showDeleteConfirmation = true
+            } label: {
+                Label("Eliminar", systemImage: "trash")
+                    .font(.subheadline)
+                    .fontWeight(.medium)
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 8)
+                    .background(Color.red, in: Capsule())
+            }
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 12)
+        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16))
+        .padding(.horizontal, 16)
+    }
+
     // MARK: - Edit Hint
-    
+
     private var editHint: some View {
         VStack(alignment: .trailing, spacing: 8) {
             HStack(spacing: 8) {
@@ -328,12 +484,11 @@ struct OffsiteCaptureDetailView: View {
                     .strokeBorder(Color.white.opacity(0.3), lineWidth: 1)
             )
             .shadow(color: .black.opacity(0.3), radius: 10)
-            
-            // Info adicional para mediciones
-            if editTool == .measure {
+
+            if viewModel.editTool == .measure {
                 VStack(alignment: .trailing, spacing: 4) {
-                    if let arMeasurements = data?.measurements.filter({ $0.isFromAR }), !arMeasurements.isEmpty {
-                        Label("Escala: \(arMeasurements.count) medición\(arMeasurements.count == 1 ? "" : "es") AR", systemImage: "checkmark.circle.fill")
+                    if let arMeasurements = viewModel.data?.measurements.filter({ $0.isFromAR }), !arMeasurements.isEmpty {
+                        Label("Escala: \(arMeasurements.count) medicion\(arMeasurements.count == 1 ? "" : "es") AR", systemImage: "checkmark.circle.fill")
                             .font(.caption)
                             .foregroundStyle(.green)
                     } else {
@@ -351,96 +506,84 @@ struct OffsiteCaptureDetailView: View {
         .padding(.trailing, 16)
         .transition(.move(edge: .top).combined(with: .opacity))
     }
-    
+
     private var hintIcon: String {
-        switch editTool {
-        case .measure: return pendingMeasurementPoint == nil ? "1.circle.fill" : "2.circle.fill"
+        switch viewModel.editTool {
+        case .select where viewModel.isDragging: return "hand.draw.fill"
+        case .select where viewModel.selectedItem != nil: return "arrow.up.and.down.and.arrow.left.and.right"
+        case .select: return "hand.point.up.left.fill"
+        case .measure: return viewModel.pendingMeasurementNormalizedPoint == nil ? "1.circle.fill" : "2.circle.fill"
         case .frame: return "rectangle.dashed"
         case .placeFrame: return "photo.artframe"
         case .text: return "text.bubble.fill"
         case .none: return ""
         }
     }
-    
+
     private var hintText: String {
-        switch editTool {
+        switch viewModel.editTool {
+        case .select where viewModel.isDragging:
+            return "Arrastrando... suelta para colocar"
+        case .select where viewModel.selectedItem != nil:
+            return "Arrastra para mover"
+        case .select:
+            return "Toca un elemento para seleccionarlo"
         case .measure:
-            return pendingMeasurementPoint == nil ? "Toca el primer punto" : "Toca el segundo punto"
+            return viewModel.pendingMeasurementNormalizedPoint == nil ? "Toca el primer punto" : "Toca el segundo punto"
         case .frame:
             return "Toca para colocar cuadro"
         case .placeFrame:
             return selectedPlaneId != nil ? "Toca en la pared para colocar" : "Selecciona una pared y toca para colocar"
         case .text:
-            return "Toca para añadir texto"
+            return "Toca para anadir texto"
         case .none:
             return ""
         }
     }
     
     // MARK: - Edit Toolbar
-    
+
     private var editToolbar: some View {
         VStack(spacing: 12) {
-            // Overlay toggles
-            HStack(spacing: 12) {
-                OverlayToggle(icon: "rectangle.dashed", label: "Planos", isOn: $showPlaneOverlays, color: .blue)
-                OverlayToggle(icon: "angle", label: "Esquinas", isOn: $showCornerMarkers, color: .yellow)
-                OverlayToggle(icon: "ruler", label: "Cotas", isOn: $showWallDimensions, color: .orange)
-                OverlayToggle(icon: "cube", label: "Cuadros 3D", isOn: $showPerspectiveFrames, color: .purple)
+            // Capas 3D en DisclosureGroup
+            DisclosureGroup("Capas 3D") {
+                HStack(spacing: 12) {
+                    OverlayToggle(icon: "rectangle.dashed", label: "Planos", isOn: $showPlaneOverlays, color: .blue)
+                    OverlayToggle(icon: "angle", label: "Esquinas", isOn: $showCornerMarkers, color: .yellow)
+                    OverlayToggle(icon: "ruler", label: "Cotas", isOn: $showWallDimensions, color: .orange)
+                    OverlayToggle(icon: "cube", label: "Cuadros 3D", isOn: $showPerspectiveFrames, color: .purple)
+                }
+                .padding(.top, 4)
             }
+            .font(.caption)
+            .foregroundStyle(.white)
             .padding(.horizontal, 16)
             .padding(.vertical, 8)
-            .background(Color.black.opacity(0.5), in: Capsule())
-            
-            // Leyenda de colores
-            if isEditMode {
-                HStack(spacing: 20) {
-                    Label("AR precisa", systemImage: "checkmark.seal.fill")
-                        .font(.caption2)
-                        .foregroundStyle(.green)
-                    Label("Offsite aprox.", systemImage: "wave.3.right")
-                        .font(.caption2)
-                        .foregroundStyle(.cyan)
+            .background(Color.black.opacity(0.5), in: RoundedRectangle(cornerRadius: 12))
+
+            HStack(spacing: 12) {
+                // Undo/Redo
+                Button { viewModel.undo() } label: {
+                    Image(systemName: "arrow.uturn.backward")
+                        .font(.title3)
+                        .foregroundStyle(viewModel.canUndo ? .white : .gray)
                 }
-                .padding(.horizontal, 16)
-                .padding(.vertical, 8)
-                .background(Color.black.opacity(0.5), in: Capsule())
-            }
-            
-            HStack(spacing: 16) {
-                ForEach([
-                    (EditTool.measure, "ruler", "Medir", Color.green),
-                    (EditTool.placeFrame, "photo.artframe", "En pared", Color.purple),
-                    (EditTool.frame, "rectangle.dashed", "Cuadro", Color.blue),
-                    (EditTool.text, "text.bubble", "Texto", Color.purple)
-                ], id: \.1) { tool, icon, label, color in
-                    Button {
-                        withAnimation(.spring(response: 0.3)) {
-                            editTool = editTool == tool ? .none : tool
-                            pendingMeasurementPoint = nil
-                            pendingMeasurementNormalizedPoint = nil
-                            pendingFrameStart = nil
-                            pendingTextNormalizedPoint = nil
-                        }
-                        HapticService.shared.impact(style: .medium)
-                    } label: {
-                        VStack(spacing: 6) {
-                            ZStack {
-                                Circle()
-                                    .fill(editTool == tool ? color : Color.gray.opacity(0.3))
-                                    .frame(width: 56, height: 56)
-                                Image(systemName: icon)
-                                    .font(.title2)
-                                    .foregroundStyle(editTool == tool ? .white : .primary)
-                            }
-                            Text(label)
-                                .font(.caption)
-                                .fontWeight(editTool == tool ? .bold : .regular)
-                                .foregroundStyle(editTool == tool ? color : .secondary)
-                        }
-                        .frame(maxWidth: .infinity)
-                    }
+                .disabled(!viewModel.canUndo)
+
+                Button { viewModel.redo() } label: {
+                    Image(systemName: "arrow.uturn.forward")
+                        .font(.title3)
+                        .foregroundStyle(viewModel.canRedo ? .white : .gray)
                 }
+                .disabled(!viewModel.canRedo)
+
+                Divider().frame(height: 30)
+
+                toolButton(.select, icon: "hand.point.up.left", label: "Mover", color: .yellow)
+                toolButton(.measure, icon: "ruler", label: "Medir", color: .green)
+                toolButton(.placeFrame, icon: "photo.artframe", label: "En pared", color: .purple)
+                toolButton(.frame, icon: "rectangle.dashed", label: "Cuadro", color: .blue)
+                toolButton(.text, icon: "text.bubble", label: "Texto", color: .purple)
             }
         }
         .padding(.horizontal, 20)
@@ -457,15 +600,39 @@ struct OffsiteCaptureDetailView: View {
         .padding(.bottom, 16)
         .shadow(color: .black.opacity(0.1), radius: 10, y: -5)
     }
+
+    private func toolButton(_ tool: OffsiteCaptureDetailViewModel.EditTool, icon: String, label: String, color: Color) -> some View {
+        Button {
+            withAnimation(.spring(response: 0.3)) {
+                viewModel.toggleEditTool(tool)
+            }
+        } label: {
+            VStack(spacing: 6) {
+                ZStack {
+                    Circle()
+                        .fill(viewModel.editTool == tool ? color : Color.gray.opacity(0.3))
+                        .frame(width: 50, height: 50)
+                    Image(systemName: icon)
+                        .font(.title3)
+                        .foregroundStyle(viewModel.editTool == tool ? .white : .primary)
+                }
+                Text(label)
+                    .font(.caption2)
+                    .fontWeight(viewModel.editTool == tool ? .bold : .regular)
+                    .foregroundStyle(viewModel.editTool == tool ? color : .secondary)
+            }
+            .frame(maxWidth: .infinity)
+        }
+    }
     
     // MARK: - Overlays
-    
+
     @ViewBuilder
     private func overlaysView(data: OffsiteCaptureData, viewSize: CGSize, imageSize: CGSize) -> some View {
-        let scale = scaleToFit(imageSize: imageSize, in: viewSize)
-        let offset = offsetToCenter(imageSize: imageSize, in: viewSize, scale: scale)
-        
-        // === Plane overlays (from scene snapshot) ===
+        let scale = viewModel.scaleToFit(imageSize: imageSize, in: viewSize)
+        let offset = viewModel.offsetToCenter(imageSize: imageSize, in: viewSize, scale: scale)
+
+        // === Plane overlays ===
         if showPlaneOverlays, let snapshot = data.sceneSnapshot {
             ForEach(snapshot.planes) { plane in
                 PlaneOverlayView(
@@ -483,7 +650,7 @@ struct OffsiteCaptureDetailView: View {
                 .opacity(overlayOpacity)
             }
         }
-        
+
         // === Wall dimensions ===
         if showWallDimensions, let snapshot = data.sceneSnapshot {
             ForEach(snapshot.wallDimensions) { wall in
@@ -492,12 +659,12 @@ struct OffsiteCaptureDetailView: View {
                     imageSize: imageSize,
                     scale: scale,
                     offset: offset,
-                    unit: unit
+                    unit: viewModel.unit
                 )
                 .opacity(overlayOpacity)
             }
         }
-        
+
         // === Corner markers ===
         if showCornerMarkers, let snapshot = data.sceneSnapshot {
             ForEach(snapshot.corners) { corner in
@@ -510,55 +677,63 @@ struct OffsiteCaptureDetailView: View {
                 .opacity(overlayOpacity)
             }
         }
-        
-        // === Perspective frames (from scene snapshot) ===
+
+        // === Perspective frames ===
         if showPerspectiveFrames, let snapshot = data.sceneSnapshot {
             ForEach(snapshot.perspectiveFrames) { frame in
+                let isSelected = viewModel.selectedItem == .perspectiveFrame(frame.id)
                 PerspectiveFrameOverlayView(
                     frame: frame,
                     imageSize: imageSize,
                     scale: scale,
                     offset: offset,
-                    isSelected: selectedFrameId == frame.id,
-                    isEditMode: isEditMode,
-                    onSelect: {
-                        if isEditMode {
-                            selectedFrameId = selectedFrameId == frame.id ? nil : frame.id
-                            HapticService.shared.impact(style: .medium)
-                        }
-                    },
+                    isSelected: isSelected,
+                    isEditMode: viewModel.isEditMode,
+                    loadedImage: viewModel.loadFrameImage(filename: frame.imageFilename, base64: frame.imageBase64),
                     onDelete: {
-                        deletePerspectiveFrame(id: frame.id)
+                        viewModel.deletePerspectiveFrame(id: frame.id)
                     }
                 )
             }
         }
-        
+
         // === Standard measurements ===
         ForEach(data.measurements) { m in
+            let isSelected = isItemSelected(item: .measurement(m.id))
+                || isItemSelected(item: .measurementEndpointA(m.id))
+                || isItemSelected(item: .measurementEndpointB(m.id))
             EnhancedMeasurementOverlay(
                 measurement: m,
                 imageSize: imageSize,
                 scale: scale,
                 offset: offset,
-                unit: unit,
-                isEditMode: isEditMode,
-                onDelete: { deleteMeasurement(id: m.id) }
+                unit: viewModel.unit,
+                isEditMode: viewModel.isEditMode,
+                isSelected: isSelected,
+                onDelete: { viewModel.deleteMeasurement(id: m.id) }
             )
         }
-        
-        // === Standard frames (non-perspective) ===
+
+        // === Standard frames ===
         ForEach(data.frames) { frame in
-            frameOverlay(frame, scale: scale, offset: offset, imageSize: imageSize)
+            let isSelected = viewModel.selectedItem?.itemId == frame.id && (
+                viewModel.selectedItem == .frame(frame.id) || viewModel.selectedItem == .frameResizeBottomRight(frame.id)
+            )
+            frameOverlay(frame, scale: scale, offset: offset, imageSize: imageSize, isSelected: isSelected)
         }
-        
+
         // === Text annotations ===
         ForEach(data.textAnnotations) { annotation in
-            textAnnotationOverlay(annotation, scale: scale, offset: offset, imageSize: imageSize)
+            let isSelected = viewModel.selectedItem == .textAnnotation(annotation.id)
+            textAnnotationOverlay(annotation, scale: scale, offset: offset, imageSize: imageSize, isSelected: isSelected)
         }
-        
+
         // === Pending measurement point ===
-        if let point = pendingMeasurementPoint {
+        if let normPoint = viewModel.pendingMeasurementNormalizedPoint {
+            let screenPoint = CGPoint(
+                x: normPoint.x * imageSize.width * scale + offset.x,
+                y: normPoint.y * imageSize.height * scale + offset.y
+            )
             ZStack {
                 Circle()
                     .fill(Color.orange)
@@ -568,85 +743,25 @@ struct OffsiteCaptureDetailView: View {
                     .frame(width: 32, height: 32)
                     .opacity(0.5)
             }
-            .position(point)
+            .position(screenPoint)
             .transition(.scale.combined(with: .opacity))
         }
     }
-    
-    @ViewBuilder
-    private func measurementOverlay(_ m: OffsiteMeasurement, scale: CGFloat, offset: CGPoint, imageSize: CGSize) -> some View {
-        let pA = CGPoint(
-            x: m.pointA.x * imageSize.width * scale + offset.x,
-            y: m.pointA.y * imageSize.height * scale + offset.y
-        )
-        let pB = CGPoint(
-            x: m.pointB.x * imageSize.width * scale + offset.x,
-            y: m.pointB.y * imageSize.height * scale + offset.y
-        )
-        
-        // Color según tipo: verde brillante = AR (precisa), cyan = offsite (aproximada)
-        let lineColor = m.isFromAR ? Color.green : Color.cyan
-        let labelBg = m.isFromAR ? Color.black.opacity(0.8) : Color.blue.opacity(0.6)
-        
-        ZStack {
-            Path { path in
-                path.move(to: pA)
-                path.addLine(to: pB)
-            }
-            .stroke(lineColor, lineWidth: m.isFromAR ? 2 : 3)
-            
-            Circle()
-                .fill(Color.orange)
-                .frame(width: 10, height: 10)
-                .position(pA)
-            
-            Circle()
-                .fill(lineColor)
-                .frame(width: 10, height: 10)
-                .position(pB)
-            
-            VStack(spacing: 2) {
-                Text(unit.format(distanceMeters: Float(m.distanceMeters)))
-                    .font(.caption)
-                    .fontWeight(.bold)
-                    .foregroundStyle(.white)
-                if !m.isFromAR {
-                    Text("≈ aproximada")
-                        .font(.caption2)
-                        .foregroundStyle(.white.opacity(0.8))
-                }
-            }
-            .padding(.horizontal, 8)
-            .padding(.vertical, 4)
-            .background(labelBg, in: RoundedRectangle(cornerRadius: 6))
-            .position(x: (pA.x + pB.x) / 2, y: (pA.y + pB.y) / 2 - 20)
-            
-            if isEditMode {
-                Button {
-                    deleteMeasurement(id: m.id)
-                } label: {
-                    Image(systemName: "xmark.circle.fill")
-                        .font(.title3)
-                        .foregroundStyle(.red)
-                        .background(Circle().fill(.white))
-                }
-                .position(x: (pA.x + pB.x) / 2 + 40, y: (pA.y + pB.y) / 2 - 20)
-            }
-        }
+
+    private func isItemSelected(item: SelectableItemType) -> Bool {
+        viewModel.selectedItem == item
     }
     
     @ViewBuilder
-    private func frameOverlay(_ frame: OffsiteFrame, scale: CGFloat, offset: CGPoint, imageSize: CGSize) -> some View {
+    private func frameOverlay(_ frame: OffsiteFrame, scale: CGFloat, offset: CGPoint, imageSize: CGSize, isSelected: Bool) -> some View {
         let x = frame.topLeft.x * imageSize.width * scale + offset.x
         let y = frame.topLeft.y * imageSize.height * scale + offset.y
         let w = frame.width * imageSize.width * scale
         let h = frame.height * imageSize.height * scale
-        
+        let borderWidth = isSelected ? AppConstants.OffsiteEditor.selectionBorderWidth : 3.0
+
         ZStack {
-            // Mostrar imagen del cuadro si existe, sino un rectángulo
-            if let base64 = frame.imageBase64,
-               let imageData = Data(base64Encoded: base64),
-               let frameImage = UIImage(data: imageData) {
+            if let frameImage = viewModel.loadFrameImage(filename: frame.imageFilename, base64: frame.imageBase64) {
                 Image(uiImage: frameImage)
                     .resizable()
                     .aspectRatio(contentMode: .fill)
@@ -654,18 +769,17 @@ struct OffsiteCaptureDetailView: View {
                     .clipShape(Rectangle())
                     .overlay(
                         Rectangle()
-                            .strokeBorder(Color(hex: frame.color), lineWidth: 3)
+                            .strokeBorder(Color(hex: frame.color), lineWidth: borderWidth)
                     )
                     .position(x: x + w/2, y: y + h/2)
             } else {
                 Rectangle()
-                    .strokeBorder(Color(hex: frame.color), lineWidth: 3)
+                    .strokeBorder(Color(hex: frame.color), lineWidth: borderWidth)
                     .background(Color(hex: frame.color).opacity(0.1))
                     .frame(width: w, height: h)
                     .position(x: x + w/2, y: y + h/2)
             }
-            
-            // Etiqueta con dimensiones reales si existen
+
             if let widthM = frame.widthMeters, let heightM = frame.heightMeters {
                 VStack(spacing: 2) {
                     if let label = frame.label {
@@ -673,7 +787,7 @@ struct OffsiteCaptureDetailView: View {
                             .font(.caption)
                             .fontWeight(.semibold)
                     }
-                    Text(String(format: "%.2f × %.2f m", widthM, heightM))
+                    Text(String(format: "%.2f x %.2f m", widthM, heightM))
                         .font(.caption2)
                 }
                 .foregroundStyle(.white)
@@ -691,74 +805,31 @@ struct OffsiteCaptureDetailView: View {
                     .background(Color(hex: frame.color), in: RoundedRectangle(cornerRadius: 4))
                     .position(x: x + w/2, y: y - 8)
             }
-            
-            if isEditMode {
-                Button {
-                    deleteFrame(id: frame.id)
-                } label: {
-                    Image(systemName: "xmark.circle.fill")
-                        .foregroundStyle(.red)
-                        .background(Circle().fill(.white))
-                }
-                .position(x: x + w - 8, y: y + 8)
-                
-                // Botones de edición de cuadro seleccionado
-                if selectedFrameId == frame.id {
-                    HStack(spacing: 8) {
-                        Button {
-                            showImagePicker = true
-                        } label: {
-                            Image(systemName: "photo")
-                                .foregroundStyle(.white)
-                                .padding(8)
-                                .background(Color.blue, in: Circle())
-                        }
-                        
-                        Button {
-                            resizeFrame(id: frame.id, increase: true)
-                        } label: {
-                            Image(systemName: "plus.magnifyingglass")
-                                .foregroundStyle(.white)
-                                .padding(8)
-                                .background(Color.green, in: Circle())
-                        }
-                        
-                        Button {
-                            resizeFrame(id: frame.id, increase: false)
-                        } label: {
-                            Image(systemName: "minus.magnifyingglass")
-                                .foregroundStyle(.white)
-                                .padding(8)
-                                .background(Color.orange, in: Circle())
-                        }
-                    }
-                    .position(x: x + w/2, y: y + h + 30)
-                }
-            }
-            
-            // Indicador de selección
-            if selectedFrameId == frame.id {
+
+            // Selection highlight
+            if isSelected {
                 Rectangle()
-                    .strokeBorder(Color.yellow, lineWidth: 4)
+                    .strokeBorder(Color.yellow, lineWidth: AppConstants.OffsiteEditor.selectionBorderWidth)
                     .frame(width: w + 8, height: h + 8)
                     .position(x: x + w/2, y: y + h/2)
-            }
-        }
-        .onTapGesture {
-            if isEditMode {
-                selectedFrameId = selectedFrameId == frame.id ? nil : frame.id
-                HapticService.shared.impact(style: .medium)
+
+                DragHandleView()
+                    .position(x: x + w/2, y: y + h/2)
+
+                // Resize handle en esquina inferior derecha
+                ResizeHandleView()
+                    .position(x: x + w, y: y + h)
             }
         }
     }
-    
+
     @ViewBuilder
-    private func textAnnotationOverlay(_ annotation: OffsiteTextAnnotation, scale: CGFloat, offset: CGPoint, imageSize: CGSize) -> some View {
+    private func textAnnotationOverlay(_ annotation: OffsiteTextAnnotation, scale: CGFloat, offset: CGPoint, imageSize: CGSize, isSelected: Bool) -> some View {
         let pos = CGPoint(
             x: annotation.position.x * imageSize.width * scale + offset.x,
             y: annotation.position.y * imageSize.height * scale + offset.y
         )
-        
+
         ZStack {
             Text(annotation.text)
                 .font(.subheadline)
@@ -766,473 +837,20 @@ struct OffsiteCaptureDetailView: View {
                 .foregroundStyle(Color(hex: annotation.color))
                 .padding(.horizontal, 8)
                 .padding(.vertical, 4)
-                .background(Color.black.opacity(0.7), in: RoundedRectangle(cornerRadius: 6))
+                .background(
+                    isSelected ? Color.yellow.opacity(0.3) : Color.black.opacity(0.7),
+                    in: RoundedRectangle(cornerRadius: 6)
+                )
+                .overlay(
+                    isSelected ? RoundedRectangle(cornerRadius: 6).strokeBorder(Color.yellow, lineWidth: 2) : nil
+                )
                 .position(pos)
-            
-            if isEditMode {
-                Button {
-                    deleteTextAnnotation(id: annotation.id)
-                } label: {
-                    Image(systemName: "xmark.circle.fill")
-                        .foregroundStyle(.red)
-                        .background(Circle().fill(.white))
-                        .font(.caption)
-                }
-                .position(x: pos.x + 40, y: pos.y - 10)
-            }
-        }
-    }
-    
-    // MARK: - Edit Handlers
-    
-    private func handleEditTap(at location: CGPoint, viewSize: CGSize, imageSize: CGSize) {
-        guard data != nil else { return }
-        
-        let scale = scaleToFit(imageSize: imageSize, in: viewSize)
-        let offset = offsetToCenter(imageSize: imageSize, in: viewSize, scale: scale)
-        
-        let normalizedX = (location.x - offset.x) / (imageSize.width * scale)
-        let normalizedY = (location.y - offset.y) / (imageSize.height * scale)
-        
-        guard normalizedX >= 0 && normalizedX <= 1 && normalizedY >= 0 && normalizedY <= 1 else { return }
-        
-        let normalizedPoint = NormalizedPoint(x: normalizedX, y: normalizedY)
-        
-        switch editTool {
-        case .measure:
-            handleMeasureTap(point: normalizedPoint, screenPoint: location, viewSize: viewSize, imageSize: imageSize)
-        case .frame:
-            handleFrameTap(point: normalizedPoint)
-        case .placeFrame:
-            handlePlaceFrameOnWall(point: normalizedPoint, viewSize: viewSize, imageSize: imageSize)
-        case .text:
-            handleTextTap(point: normalizedPoint, screenPoint: location, viewSize: viewSize, imageSize: imageSize)
-        case .none:
-            break
-        }
-    }
-    
-    private func handleMeasureTap(point: NormalizedPoint, screenPoint: CGPoint, viewSize: CGSize, imageSize: CGSize) {
-        guard var currentData = data else { return }
-        
-        if let firstPointScreen = pendingMeasurementPoint, let firstPointNorm = pendingMeasurementNormalizedPoint {
-            // Calcular distancia basada en mediciones AR de referencia
-            let distance = calculateDistance(from: firstPointScreen, to: screenPoint, viewSize: viewSize, imageSize: imageSize)
-            
-            let newMeasurement = OffsiteMeasurement(
-                distanceMeters: distance,
-                pointA: firstPointNorm,
-                pointB: point,
-                isFromAR: false  // Medición añadida offsite
-            )
-            currentData.measurements.append(newMeasurement)
-            data = currentData
-            pendingMeasurementPoint = nil
-            pendingMeasurementNormalizedPoint = nil
-            
-            HapticService.shared.notification(type: .success)
-        } else {
-            pendingMeasurementPoint = screenPoint
-            pendingMeasurementNormalizedPoint = point
-            HapticService.shared.impact(style: .medium)
-        }
-    }
-    
-    private func handleFrameTap(point: NormalizedPoint) {
-        guard var currentData = data else { return }
-        
-        // Usar dimensiones reales si hay metadata del LiDAR, sino usar tamaño por defecto
-        let defaultSize = AppConstants.OffsiteEditor.defaultFrameSize
-        var widthMeters: Double? = nil
-        var heightMeters: Double? = nil
-        
-        // Si hay metadata del LiDAR, usar dimensiones basadas en escala real
-        if let metadata = currentData.lidarMetadata, !metadata.planeDimensions.isEmpty {
-            // Usar promedio de dimensiones de planos como referencia
-            let avgWidth = metadata.planeDimensions.map { $0.width }.reduce(0, +) / Double(metadata.planeDimensions.count)
-            widthMeters = avgWidth * 0.15  // 15% del ancho promedio del plano
-            heightMeters = widthMeters! * 1.2  // Proporción típica de un cuadro
-        }
-        
-        let newFrame = OffsiteFrame(
-            topLeft: point,
-            width: defaultSize,
-            height: defaultSize,
-            label: "Cuadro \(currentData.frames.count + 1)",
-            color: AppConstants.OffsiteEditor.availableColors.randomElement() ?? "#3B82F6",
-            widthMeters: widthMeters,
-            heightMeters: heightMeters,
-            imageBase64: nil,
-            isCornerFrame: false
-        )
-        currentData.frames.append(newFrame)
-        data = currentData
-        
-        HapticService.shared.notification(type: .success)
-    }
-    
-    private func handleTextTap(point: NormalizedPoint, screenPoint: CGPoint, viewSize: CGSize, imageSize: CGSize) {
-        pendingTextNormalizedPoint = point
-        newTextPosition = screenPoint
-        showTextInput = true
-    }
-    
-    private func addTextAnnotation() {
-        guard let normalizedPoint = pendingTextNormalizedPoint, !newTextContent.isEmpty, var currentData = data else { return }
-        
-        let annotation = OffsiteTextAnnotation(
-            position: normalizedPoint,
-            text: newTextContent
-        )
-        currentData.textAnnotations.append(annotation)
-        data = currentData
-        newTextContent = ""
-        newTextPosition = nil
-        pendingTextNormalizedPoint = nil
-        
-        HapticService.shared.notification(type: .success)
-    }
-    
-    private func calculateDistance(from pointA: CGPoint, to pointB: CGPoint, viewSize: CGSize, imageSize: CGSize) -> Double {
-        let dx = pointB.x - pointA.x
-        let dy = pointB.y - pointA.y
-        let pixelDistance = sqrt(dx*dx + dy*dy)
-        
-        // Buscar mediciones AR de referencia (isFromAR = true)
-        if let currentData = data,
-           let arMeasurement = currentData.measurements.first(where: { $0.isFromAR }) {
-            
-            let scale = scaleToFit(imageSize: imageSize, in: viewSize)
-            let offset = offsetToCenter(imageSize: imageSize, in: viewSize, scale: scale)
-            
-            let refA = CGPoint(
-                x: arMeasurement.pointA.x * imageSize.width * scale + offset.x,
-                y: arMeasurement.pointA.y * imageSize.height * scale + offset.y
-            )
-            let refB = CGPoint(
-                x: arMeasurement.pointB.x * imageSize.width * scale + offset.x,
-                y: arMeasurement.pointB.y * imageSize.height * scale + offset.y
-            )
-            let refDx = refB.x - refA.x
-            let refDy = refB.y - refA.y
-            let refPixelDistance = sqrt(refDx*refDx + refDy*refDy)
-            
-            // Calcular proporción basada en medición AR precisa
-            let metersPerPixel = arMeasurement.distanceMeters / refPixelDistance
-            return pixelDistance * metersPerPixel
-        }
-        
-        // Sin referencia AR: distancia arbitraria (muy aproximada)
-        return pixelDistance * AppConstants.OffsiteEditor.estimatedMetersPerPixel
-    }
-    
-    // MARK: - Delete Actions
-    
-    private func deleteMeasurement(id: UUID) {
-        guard var currentData = data else { return }
-        currentData.measurements.removeAll { $0.id == id }
-        data = currentData
-        HapticService.shared.impact(style: .light)
-    }
-    
-    private func deleteFrame(id: UUID) {
-        guard var currentData = data else { return }
-        currentData.frames.removeAll { $0.id == id }
-        data = currentData
-        selectedFrameId = nil
-        HapticService.shared.impact(style: .light)
-    }
-    
-    private func deleteTextAnnotation(id: UUID) {
-        guard var currentData = data else { return }
-        currentData.textAnnotations.removeAll { $0.id == id }
-        data = currentData
-        HapticService.shared.impact(style: .light)
-    }
-    
-    // MARK: - Frame Edit Actions
-    
-    /// Coloca un cuadro dentro de una pared detectada con perspectiva.
-    private func handlePlaceFrameOnWall(point: NormalizedPoint, viewSize: CGSize, imageSize: CGSize) {
-        guard var currentData = data, let snapshot = currentData.sceneSnapshot else {
-            // Fallback to regular frame if no snapshot
-            handleFrameTap(point: point)
-            return
-        }
-        
-        // Encontrar el plano que contiene este punto
-        let targetPlane = findPlaneContaining(point: point, in: snapshot)
-        
-        // Calcular dimensiones del cuadro basadas en la escala real
-        let frameWidthMeters: Double
-        let frameHeightMeters: Double
-        
-        if let plane = targetPlane {
-            // Usar 20% del ancho del plano
-            frameWidthMeters = plane.widthMeters * 0.2
-            frameHeightMeters = frameWidthMeters * 1.3 // Proporción cuadro
-        } else if let scale = snapshot.metersPerPixelScale {
-            frameWidthMeters = scale * 0.15 * Double(imageSize.width)
-            frameHeightMeters = frameWidthMeters * 1.3
-        } else {
-            frameWidthMeters = 0.5
-            frameHeightMeters = 0.65
-        }
-        
-        // Calcular las 4 esquinas con perspectiva del plano
-        let halfW = 0.075 // 7.5% normalizado
-        let halfH = halfW * 1.3
-        
-        let corners: [[Double]]
-        if let plane = targetPlane, plane.projectedVertices.count >= 4 {
-            // Calcular perspectiva real basada en el plano
-            let planeCorners = plane.projectedVertices
-            corners = calculatePerspectiveCorners(
-                center: point,
-                halfW: halfW,
-                halfH: halfH,
-                planeVertices: planeCorners
-            )
-        } else {
-            // Sin perspectiva - esquinas rectangulares
-            corners = [
-                [point.x - halfW, point.y - halfH],
-                [point.x + halfW, point.y - halfH],
-                [point.x + halfW, point.y + halfH],
-                [point.x - halfW, point.y + halfH]
-            ]
-        }
-        
-        let newFrame = OffsiteFramePerspective(
-            planeId: targetPlane?.id,
-            center2D: point,
-            corners2D: corners,
-            widthMeters: frameWidthMeters,
-            heightMeters: frameHeightMeters,
-            label: "Cuadro \((snapshot.perspectiveFrames.count) + 1)",
-            color: AppConstants.OffsiteEditor.availableColors.randomElement() ?? "#3B82F6"
-        )
-        
-        var updatedSnapshot = snapshot
-        updatedSnapshot.perspectiveFrames.append(newFrame)
-        currentData.sceneSnapshot = updatedSnapshot
-        data = currentData
-        
-        HapticService.shared.notification(type: .success)
-    }
-    
-    /// Encuentra el plano que contiene un punto normalizado.
-    private func findPlaneContaining(point: NormalizedPoint, in snapshot: OffsiteSceneSnapshot) -> OffsitePlaneData? {
-        for plane in snapshot.planes {
-            if isPointInPolygon(point: point, vertices: plane.projectedVertices) {
-                return plane
-            }
-        }
-        // Si hay plano seleccionado, usarlo
-        if let selectedId = selectedPlaneId {
-            return snapshot.planes.first { $0.id == selectedId }
-        }
-        return nil
-    }
-    
-    /// Verifica si un punto está dentro de un polígono (ray casting).
-    private func isPointInPolygon(point: NormalizedPoint, vertices: [[Double]]) -> Bool {
-        guard vertices.count >= 3 else { return false }
-        var inside = false
-        var j = vertices.count - 1
-        
-        for i in 0..<vertices.count {
-            guard vertices[i].count >= 2, vertices[j].count >= 2 else { j = i; continue }
-            let xi = vertices[i][0], yi = vertices[i][1]
-            let xj = vertices[j][0], yj = vertices[j][1]
-            
-            if ((yi > point.y) != (yj > point.y)) && (point.x < (xj - xi) * (point.y - yi) / (yj - yi) + xi) {
-                inside.toggle()
-            }
-            j = i
-        }
-        return inside
-    }
-    
-    /// Calcula esquinas con perspectiva basadas en las esquinas del plano.
-    private func calculatePerspectiveCorners(center: NormalizedPoint, halfW: Double, halfH: Double, planeVertices: [[Double]]) -> [[Double]] {
-        guard planeVertices.count >= 4 else {
-            return [
-                [center.x - halfW, center.y - halfH],
-                [center.x + halfW, center.y - halfH],
-                [center.x + halfW, center.y + halfH],
-                [center.x - halfW, center.y + halfH]
-            ]
-        }
-        
-        // Interpolar la perspectiva del plano
-        // Los vértices del plano definen la distorsión perspectiva
-        let pTL = planeVertices[0], pTR = planeVertices[1]
-        let pBR = planeVertices[2], pBL = planeVertices[3]
-        
-        guard pTL.count >= 2, pTR.count >= 2, pBR.count >= 2, pBL.count >= 2 else {
-            return [
-                [center.x - halfW, center.y - halfH],
-                [center.x + halfW, center.y - halfH],
-                [center.x + halfW, center.y + halfH],
-                [center.x - halfW, center.y + halfH]
-            ]
-        }
-        
-        // Calcular el factor de perspectiva (convergencia de líneas verticales)
-        let topWidth = sqrt(pow(pTR[0] - pTL[0], 2) + pow(pTR[1] - pTL[1], 2))
-        let bottomWidth = sqrt(pow(pBR[0] - pBL[0], 2) + pow(pBR[1] - pBL[1], 2))
-        
-        guard topWidth > 0.001, bottomWidth > 0.001 else {
-            return [
-                [center.x - halfW, center.y - halfH],
-                [center.x + halfW, center.y - halfH],
-                [center.x + halfW, center.y + halfH],
-                [center.x - halfW, center.y + halfH]
-            ]
-        }
-        
-        // Posición relativa del centro dentro del plano (0-1)
-        let planeCenterX = (pTL[0] + pTR[0] + pBR[0] + pBL[0]) / 4
-        let planeCenterY = (pTL[1] + pTR[1] + pBR[1] + pBL[1]) / 4
-        let planeHeight = sqrt(pow(planeCenterX - (pTL[0] + pBL[0]) / 2, 2) + pow(planeCenterY - (pTL[1] + pBL[1]) / 2, 2)) * 2
-        
-        let relY = planeHeight > 0.001 ? (center.y - min(pTL[1], pTR[1])) / planeHeight : 0.5
-        
-        // Interpolar ancho en la posición del cuadro
-        let perspectiveRatio = topWidth > 0 ? bottomWidth / topWidth : 1.0
-        let localRatio = 1.0 + (perspectiveRatio - 1.0) * relY
-        
-        let topHalfW = halfW / localRatio
-        let bottomHalfW = halfW * localRatio
-        
-        return [
-            [center.x - topHalfW, center.y - halfH],
-            [center.x + topHalfW, center.y - halfH],
-            [center.x + bottomHalfW, center.y + halfH],
-            [center.x - bottomHalfW, center.y + halfH]
-        ]
-    }
-    
-    /// Elimina un cuadro con perspectiva.
-    private func deletePerspectiveFrame(id: UUID) {
-        guard var currentData = data, var snapshot = currentData.sceneSnapshot else { return }
-        snapshot.perspectiveFrames.removeAll { $0.id == id }
-        currentData.sceneSnapshot = snapshot
-        data = currentData
-        selectedFrameId = nil
-        HapticService.shared.impact(style: .light)
-    }
-    
-    private func resizeFrame(id: UUID, increase: Bool) {
-        guard var currentData = data else { return }
-        guard let index = currentData.frames.firstIndex(where: { $0.id == id }) else { return }
-        
-        var frame = currentData.frames[index]
-        let delta = increase ? 0.02 : -0.02  // Incremento normalizado
-        
-        frame.width = max(0.05, min(0.5, frame.width + delta))
-        frame.height = max(0.05, min(0.5, frame.height + delta))
-        
-        // Actualizar dimensiones reales si existen
-        if let widthM = frame.widthMeters, let heightM = frame.heightMeters {
-            let ratio = frame.width / (frame.width - delta)
-            frame.widthMeters = widthM * ratio
-            frame.heightMeters = heightM * ratio
-        }
-        
-        currentData.frames[index] = frame
-        data = currentData
-        HapticService.shared.impact(style: .medium)
-    }
-    
-    private func updateFrameImage(id: UUID, image: UIImage) {
-        guard var currentData = data else { return }
-        guard let index = currentData.frames.firstIndex(where: { $0.id == id }) else { return }
-        
-        var frame = currentData.frames[index]
-        if let jpegData = image.jpegData(compressionQuality: 0.8) {
-            frame.imageBase64 = jpegData.base64EncodedString()
-            currentData.frames[index] = frame
-            data = currentData
-            HapticService.shared.notification(type: .success)
-        }
-    }
-    
-    // MARK: - Save & Cancel
-    
-    private func saveChanges() {
-        guard var currentData = data else { return }
-        currentData.lastModified = Date()
-        
-        // Sincronizar mediciones del snapshot con las del nivel superior
-        if var snapshot = currentData.sceneSnapshot {
-            snapshot.measurements = currentData.measurements
-            snapshot.frames = currentData.frames
-            snapshot.textAnnotations = currentData.textAnnotations
-            snapshot.lastModified = Date()
-            currentData.sceneSnapshot = snapshot
-        }
-        
-        do {
-            let encoder = JSONEncoder()
-            encoder.dateEncodingStrategy = .iso8601
-            encoder.outputFormatting = .prettyPrinted
-            try encoder.encode(currentData).write(to: entry.jsonURL)
-            data = currentData
-            HapticService.shared.notification(type: .success)
-            isEditMode = false
-            editTool = .none
-            pendingMeasurementPoint = nil
-            pendingMeasurementNormalizedPoint = nil
-            pendingFrameStart = nil
-            pendingTextNormalizedPoint = nil
-        } catch {
-            // Error silenciado - en producción usar Logger
-        }
-    }
-    
-    private func cancelEdit() {
-        loadData()
-        isEditMode = false
-        editTool = .none
-        pendingMeasurementPoint = nil
-        pendingMeasurementNormalizedPoint = nil
-        pendingFrameStart = nil
-        pendingTextNormalizedPoint = nil
-    }
-    
-    private func loadData() {
-        if let d = try? Data(contentsOf: entry.jsonURL) {
-            let decoder = JSONDecoder()
-            decoder.dateDecodingStrategy = .custom { decoder in
-                let c = try decoder.singleValueContainer()
-                let s = try c.decode(String.self)
-                let f = ISO8601DateFormatter()
-                f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-                if let date = f.date(from: s) { return date }
-                f.formatOptions = [.withInternetDateTime]
-                return f.date(from: s) ?? Date()
-            }
-            if let decoded = try? decoder.decode(OffsiteCaptureData.self, from: d) {
-                data = decoded
-            }
-        }
-    }
-    
-    // MARK: - Helpers
-    
-    func scaleToFit(imageSize: CGSize, in viewSize: CGSize) -> CGFloat {
-        guard imageSize.width > 0, imageSize.height > 0 else { return 1 }
-        let sx = viewSize.width / imageSize.width
-        let sy = viewSize.height / imageSize.height
-        return min(sx, sy)
-    }
 
-    func offsetToCenter(imageSize: CGSize, in viewSize: CGSize, scale: CGFloat) -> CGPoint {
-        let w = imageSize.width * scale
-        let h = imageSize.height * scale
-        return CGPoint(x: (viewSize.width - w) / 2, y: (viewSize.height - h) / 2)
+            if isSelected {
+                DragHandleView()
+                    .position(x: pos.x + 50, y: pos.y)
+            }
+        }
     }
 }
 

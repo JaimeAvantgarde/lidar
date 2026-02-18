@@ -7,6 +7,71 @@
 //
 
 import SwiftUI
+import CoreImage
+import CoreImage.CIFilterBuiltins
+
+// MARK: - Perspective Image Transform
+
+/// Cache de imagenes transformadas con perspectiva para evitar recalculos cada render.
+@MainActor
+final class PerspectiveImageCache {
+    static let shared = PerspectiveImageCache()
+    private var cache: [UUID: UIImage] = [:]
+    private var cornerKeys: [UUID: String] = [:]
+    private let context = CIContext()
+
+    func image(for frameId: UUID, sourceImage: UIImage, corners: [CGPoint], boundingRect: CGRect) -> UIImage? {
+        let key = corners.map { "\(Int($0.x)),\(Int($0.y))" }.joined(separator: "|")
+        if let cached = cache[frameId], cornerKeys[frameId] == key {
+            return cached
+        }
+
+        guard let result = applyPerspectiveTransform(sourceImage, to: corners, in: boundingRect) else {
+            return nil
+        }
+        cache[frameId] = result
+        cornerKeys[frameId] = key
+        return result
+    }
+
+    func invalidate(frameId: UUID) {
+        cache.removeValue(forKey: frameId)
+        cornerKeys.removeValue(forKey: frameId)
+    }
+
+    private func applyPerspectiveTransform(_ image: UIImage, to corners: [CGPoint], in rect: CGRect) -> UIImage? {
+        guard corners.count == 4, let ciImage = CIImage(image: image) else { return nil }
+
+        let imgW = ciImage.extent.width
+        let imgH = ciImage.extent.height
+
+        // Corners relativos al bounding rect, convertidos a coordenadas CI (Y invertida)
+        let minX = rect.minX
+        let minY = rect.minY
+        let h = rect.height
+
+        let tl = CIVector(x: CGFloat(corners[0].x - minX), y: CGFloat(h - (corners[0].y - minY)))
+        let tr = CIVector(x: CGFloat(corners[1].x - minX), y: CGFloat(h - (corners[1].y - minY)))
+        let br = CIVector(x: CGFloat(corners[2].x - minX), y: CGFloat(h - (corners[2].y - minY)))
+        let bl = CIVector(x: CGFloat(corners[3].x - minX), y: CGFloat(h - (corners[3].y - minY)))
+
+        // Primero escalar la imagen al tamano del bounding rect
+        let scaleX = rect.width / imgW
+        let scaleY = rect.height / imgH
+        let scaled = ciImage.transformed(by: CGAffineTransform(scaleX: scaleX, y: scaleY))
+
+        guard let filter = CIFilter(name: "CIPerspectiveTransform") else { return nil }
+        filter.setValue(scaled, forKey: kCIInputImageKey)
+        filter.setValue(tl, forKey: "inputTopLeft")
+        filter.setValue(tr, forKey: "inputTopRight")
+        filter.setValue(br, forKey: "inputBottomRight")
+        filter.setValue(bl, forKey: "inputBottomLeft")
+
+        guard let output = filter.outputImage else { return nil }
+        guard let cgImage = context.createCGImage(output, from: output.extent) else { return nil }
+        return UIImage(cgImage: cgImage)
+    }
+}
 
 // MARK: - Plane Overlay
 
@@ -225,7 +290,7 @@ struct PerspectiveFrameOverlayView: View {
     let offset: CGPoint
     let isSelected: Bool
     let isEditMode: Bool
-    let onSelect: () -> Void
+    let loadedImage: UIImage?
     let onDelete: () -> Void
     
     var body: some View {
@@ -240,21 +305,33 @@ struct PerspectiveFrameOverlayView: View {
         ZStack {
             if corners.count == 4 {
                 // Dibujar cuadro con perspectiva (cuadrilátero)
-                if let base64 = frame.imageBase64,
-                   let imageData = Data(base64Encoded: base64),
-                   let uiImage = UIImage(data: imageData) {
-                    // Imagen con perspectiva - usamos el bounding box
+                if let uiImage = loadedImage {
                     let minX = corners.map(\.x).min() ?? 0
                     let maxX = corners.map(\.x).max() ?? 0
                     let minY = corners.map(\.y).min() ?? 0
                     let maxY = corners.map(\.y).max() ?? 0
-                    
-                    Image(uiImage: uiImage)
-                        .resizable()
-                        .aspectRatio(contentMode: .fill)
-                        .frame(width: maxX - minX, height: maxY - minY)
-                        .clipShape(PerspectiveShape(corners: corners))
-                        .position(x: (minX + maxX) / 2, y: (minY + maxY) / 2)
+                    let boundingRect = CGRect(x: minX, y: minY, width: maxX - minX, height: maxY - minY)
+
+                    // Intentar transformacion con perspectiva real via Core Image
+                    if let transformed = PerspectiveImageCache.shared.image(
+                        for: frame.id, sourceImage: uiImage,
+                        corners: corners, boundingRect: boundingRect
+                    ) {
+                        Image(uiImage: transformed)
+                            .resizable()
+                            .aspectRatio(contentMode: .fill)
+                            .frame(width: boundingRect.width, height: boundingRect.height)
+                            .clipShape(PerspectiveShape(corners: corners))
+                            .position(x: boundingRect.midX, y: boundingRect.midY)
+                    } else {
+                        // Fallback: clip sin transformacion
+                        Image(uiImage: uiImage)
+                            .resizable()
+                            .aspectRatio(contentMode: .fill)
+                            .frame(width: boundingRect.width, height: boundingRect.height)
+                            .clipShape(PerspectiveShape(corners: corners))
+                            .position(x: boundingRect.midX, y: boundingRect.midY)
+                    }
                 }
                 
                 // Contorno con perspectiva
@@ -314,7 +391,6 @@ struct PerspectiveFrameOverlayView: View {
                 }
             }
         }
-        .onTapGesture(perform: onSelect)
     }
 }
 
@@ -342,7 +418,7 @@ struct PerspectiveShape: Shape {
 
 // MARK: - Enhanced Measurement Overlay
 
-/// Overlay de medición mejorado con indicadores de precisión y snap.
+/// Overlay de medicion mejorado con indicadores de precision, snap y seleccion.
 struct EnhancedMeasurementOverlay: View {
     let measurement: OffsiteMeasurement
     let imageSize: CGSize
@@ -350,8 +426,9 @@ struct EnhancedMeasurementOverlay: View {
     let offset: CGPoint
     let unit: MeasurementUnit
     let isEditMode: Bool
+    var isSelected: Bool = false
     let onDelete: () -> Void
-    
+
     var body: some View {
         let pA = CGPoint(
             x: measurement.pointA.x * imageSize.width * scale + offset.x,
@@ -361,52 +438,59 @@ struct EnhancedMeasurementOverlay: View {
             x: measurement.pointB.x * imageSize.width * scale + offset.x,
             y: measurement.pointB.y * imageSize.height * scale + offset.y
         )
-        
+
         let lineColor: Color = measurement.isFromAR ? .green : .cyan
         let labelBg: Color = measurement.isFromAR ? Color.black.opacity(0.85) : Color.blue.opacity(0.7)
-        
+        let glowColor: Color = isSelected ? .yellow : lineColor
+
         ZStack {
-            // Línea de medición con efecto glow
+            // Glow / selection highlight
             Path { path in
                 path.move(to: pA)
                 path.addLine(to: pB)
             }
-            .stroke(lineColor.opacity(0.3), lineWidth: measurement.isFromAR ? 6 : 4)
-            
+            .stroke(glowColor.opacity(isSelected ? 0.6 : 0.3), lineWidth: isSelected ? 8 : (measurement.isFromAR ? 6 : 4))
+
             Path { path in
                 path.move(to: pA)
                 path.addLine(to: pB)
             }
-            .stroke(lineColor, lineWidth: measurement.isFromAR ? 2.5 : 2)
-            
-            // Endpoints mejorados
-            MeasurementEndpoint(color: .orange)
-                .position(pA)
-            
-            MeasurementEndpoint(color: lineColor)
-                .position(pB)
-            
-            // Etiqueta con más info
+            .stroke(isSelected ? Color.yellow : lineColor, lineWidth: measurement.isFromAR ? 2.5 : 2)
+
+            // Endpoints
+            if isSelected {
+                DragHandleView()
+                    .position(pA)
+                DragHandleView()
+                    .position(pB)
+            } else {
+                MeasurementEndpoint(color: .orange)
+                    .position(pA)
+                MeasurementEndpoint(color: lineColor)
+                    .position(pB)
+            }
+
+            // Label
             VStack(spacing: 2) {
                 Text(unit.format(distanceMeters: Float(measurement.distanceMeters)))
                     .font(.caption)
                     .fontWeight(.bold)
-                    .foregroundStyle(.white)
-                
+                    .foregroundStyle(isSelected ? .black : .white)
+
                 HStack(spacing: 4) {
                     Image(systemName: measurement.isFromAR ? "checkmark.seal.fill" : "wave.3.right")
                         .font(.system(size: 8))
-                    Text(measurement.isFromAR ? "AR precisa" : "≈ estimada")
+                    Text(measurement.isFromAR ? "AR precisa" : "~ estimada")
                         .font(.system(size: 9))
                 }
-                .foregroundStyle(.white.opacity(0.85))
+                .foregroundStyle(isSelected ? .black.opacity(0.7) : .white.opacity(0.85))
             }
             .padding(.horizontal, 10)
             .padding(.vertical, 5)
-            .background(labelBg, in: RoundedRectangle(cornerRadius: 8))
+            .background(isSelected ? Color.yellow.opacity(0.9) : labelBg, in: RoundedRectangle(cornerRadius: 8))
             .position(x: (pA.x + pB.x) / 2, y: (pA.y + pB.y) / 2 - 22)
-            
-            if isEditMode {
+
+            if isEditMode && !isSelected {
                 Button(action: onDelete) {
                     Image(systemName: "xmark.circle.fill")
                         .font(.title3)
@@ -481,7 +565,7 @@ private struct InfoChip: View {
     let icon: String
     let value: String
     let label: String
-    
+
     var body: some View {
         VStack(spacing: 2) {
             HStack(spacing: 3) {
@@ -494,6 +578,43 @@ private struct InfoChip: View {
             Text(label)
                 .font(.system(size: 8))
                 .foregroundStyle(.secondary)
+        }
+    }
+}
+
+// MARK: - Drag Handle
+
+/// Handle visual de drag: circulo amarillo con icono de flechas.
+struct DragHandleView: View {
+    var body: some View {
+        ZStack {
+            Circle()
+                .fill(Color.yellow)
+                .frame(
+                    width: AppConstants.OffsiteEditor.dragHandleSize,
+                    height: AppConstants.OffsiteEditor.dragHandleSize
+                )
+                .shadow(color: .black.opacity(0.4), radius: 3, y: 1)
+            Image(systemName: "arrow.up.and.down.and.arrow.left.and.right")
+                .font(.system(size: 12, weight: .bold))
+                .foregroundStyle(.black)
+        }
+    }
+}
+
+// MARK: - Resize Handle
+
+/// Handle visual de resize: circulo blanco con icono de diagonal.
+struct ResizeHandleView: View {
+    var body: some View {
+        ZStack {
+            Circle()
+                .fill(Color.white)
+                .frame(width: 22, height: 22)
+                .shadow(color: .black.opacity(0.4), radius: 3, y: 1)
+            Image(systemName: "arrow.up.left.and.arrow.down.right")
+                .font(.system(size: 10, weight: .bold))
+                .foregroundStyle(.blue)
         }
     }
 }

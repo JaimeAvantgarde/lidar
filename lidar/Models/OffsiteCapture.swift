@@ -43,9 +43,9 @@ struct NormalizedPoint: Codable, Equatable, Hashable {
 // MARK: - Offsite Measurement
 struct OffsiteMeasurement: Codable, Identifiable, Hashable {
     var id: UUID
-    let distanceMeters: Double
-    let pointA: NormalizedPoint
-    let pointB: NormalizedPoint
+    var distanceMeters: Double
+    var pointA: NormalizedPoint
+    var pointB: NormalizedPoint
     let isFromAR: Bool  // true = medición AR original (precisa), false = añadida offsite (aproximada)
 
     init(id: UUID = UUID(), distanceMeters: Double, pointA: NormalizedPoint, pointB: NormalizedPoint, isFromAR: Bool = true) {
@@ -69,10 +69,11 @@ struct OffsiteFrame: Codable, Identifiable, Hashable {
     // Nuevos campos: dimensiones reales del cuadro
     var widthMeters: Double?  // Ancho real en metros
     var heightMeters: Double? // Alto real en metros
-    var imageBase64: String?  // Imagen del cuadro en base64
+    var imageBase64: String?  // Imagen del cuadro en base64 (legacy)
+    var imageFilename: String?  // Nombre del archivo de imagen separado
     var isCornerFrame: Bool   // Si es cuadro de esquina
     
-    init(id: UUID = UUID(), topLeft: NormalizedPoint, width: Double, height: Double, label: String? = nil, color: String = "#3B82F6", widthMeters: Double? = nil, heightMeters: Double? = nil, imageBase64: String? = nil, isCornerFrame: Bool = false) {
+    init(id: UUID = UUID(), topLeft: NormalizedPoint, width: Double, height: Double, label: String? = nil, color: String = "#3B82F6", widthMeters: Double? = nil, heightMeters: Double? = nil, imageBase64: String? = nil, imageFilename: String? = nil, isCornerFrame: Bool = false) {
         self.id = id
         self.topLeft = topLeft
         self.width = width
@@ -82,6 +83,7 @@ struct OffsiteFrame: Codable, Identifiable, Hashable {
         self.widthMeters = widthMeters
         self.heightMeters = heightMeters
         self.imageBase64 = imageBase64
+        self.imageFilename = imageFilename
         self.isCornerFrame = isCornerFrame
     }
 }
@@ -89,7 +91,7 @@ struct OffsiteFrame: Codable, Identifiable, Hashable {
 /// Anotación de texto sobre la imagen.
 struct OffsiteTextAnnotation: Codable, Identifiable, Hashable {
     var id: UUID
-    let position: NormalizedPoint
+    var position: NormalizedPoint
     var text: String
     var color: String  // Hex color
     
@@ -166,5 +168,28 @@ struct OffsiteCaptureData: Codable, Equatable {
     /// Escala metros/pixel
     var metersPerPixelScale: Double? {
         sceneSnapshot?.metersPerPixelScale
+    }
+}
+
+// MARK: - Selectable Item Type
+
+/// Tipo de elemento seleccionable en el editor offsite.
+enum SelectableItemType: Equatable {
+    case measurement(UUID)
+    case measurementEndpointA(UUID)
+    case measurementEndpointB(UUID)
+    case frame(UUID)
+    case frameResizeBottomRight(UUID)
+    case perspectiveFrame(UUID)
+    case textAnnotation(UUID)
+
+    /// UUID del elemento asociado (compartido entre variantes del mismo item).
+    var itemId: UUID {
+        switch self {
+        case .measurement(let id), .measurementEndpointA(let id), .measurementEndpointB(let id),
+             .frame(let id), .frameResizeBottomRight(let id),
+             .perspectiveFrame(let id), .textAnnotation(let id):
+            return id
+        }
     }
 }

@@ -94,6 +94,33 @@ struct CuadrosSectionView: View {
                     .glassBackground(cornerRadius: 14)
                 }
 
+                // Vinilo: cubrir pared completa
+                Button {
+                    sceneManager.isVinylMode.toggle()
+                } label: {
+                    HStack(spacing: 8) {
+                        Image(systemName: "rectangle.inset.filled")
+                            .font(.body)
+                        Text(sceneManager.isVinylMode ? "Toca una pared…" : "Cubrir pared")
+                            .font(.subheadline)
+                            .fontWeight(.medium)
+                        Spacer(minLength: 0)
+                        if sceneManager.isVinylMode {
+                            Image(systemName: "xmark.circle.fill")
+                                .font(.subheadline)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    .padding(12)
+                    .glassBackground(cornerRadius: 12)
+                }
+                .buttonStyle(.plain)
+                .tint(sceneManager.isVinylMode ? .orange : nil)
+                .disabled(sceneManager.selectedFrameImage == nil && !sceneManager.isVinylMode)
+                .opacity(sceneManager.selectedFrameImage == nil && !sceneManager.isVinylMode ? 0.5 : 1.0)
+                .accessibilityLabel(sceneManager.isVinylMode ? "Cancelar modo vinilo" : "Cubrir pared con imagen")
+                .accessibilityHint("Coloca la imagen seleccionada cubriendo toda la pared detectada")
+
                 // Foto para nuevos + contador (compacto)
                 HStack(spacing: 10) {
                     PhotosPicker(selection: $selectedPhotoItem, matching: .images, photoLibrary: .shared()) {

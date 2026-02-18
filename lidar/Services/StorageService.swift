@@ -26,6 +26,12 @@ protocol StorageServiceProtocol: Sendable {
     func createCaptureFiles(image: UIImage) throws -> CaptureFileURLs
     /// Directorio donde se almacenan las capturas.
     var capturesDirectory: URL { get }
+    /// Guarda la imagen de un cuadro como archivo separado y devuelve el filename.
+    func saveFrameImage(_ image: UIImage, captureId: String, frameId: UUID) throws -> String
+    /// Carga la imagen de un cuadro desde archivo.
+    func loadFrameImage(captureId: String, filename: String) -> UIImage?
+    /// Elimina la imagen de un cuadro.
+    func deleteFrameImage(captureId: String, filename: String)
 }
 
 // MARK: - Supporting Types
@@ -107,6 +113,7 @@ final class StorageService: StorageServiceProtocol, @unchecked Sendable {
 
     func deleteCapture(_ entry: OffsiteCaptureEntry) {
         let thumbURL = thumbnailURL(for: entry.imageURL)
+        let framesDir = framesDirectory(for: entry.id)
 
         for url in [entry.imageURL, entry.jsonURL, thumbURL] {
             do {
@@ -116,6 +123,11 @@ final class StorageService: StorageServiceProtocol, @unchecked Sendable {
             } catch {
                 logger.warning("Error eliminando \(url.lastPathComponent): \(error.localizedDescription)")
             }
+        }
+
+        // Eliminar directorio de frames si existe
+        if fileManager.fileExists(atPath: framesDir.path) {
+            try? fileManager.removeItem(at: framesDir)
         }
         logger.info("Captura eliminada: \(entry.id)")
     }
@@ -181,6 +193,36 @@ final class StorageService: StorageServiceProtocol, @unchecked Sendable {
         return CaptureFileURLs(imageURL: imageURL, jsonURL: jsonURL, thumbnailURL: thumbURL, baseName: baseName)
     }
 
+    // MARK: - Frame Images
+
+    private func framesDirectory(for captureId: String) -> URL {
+        capturesDirectory.appendingPathComponent("\(captureId)_frames", isDirectory: true)
+    }
+
+    func saveFrameImage(_ image: UIImage, captureId: String, frameId: UUID) throws -> String {
+        let dir = framesDirectory(for: captureId)
+        try fileManager.createDirectory(at: dir, withIntermediateDirectories: true)
+        let filename = "\(frameId.uuidString).jpg"
+        let fileURL = dir.appendingPathComponent(filename)
+        guard let jpegData = image.jpegData(compressionQuality: AppConstants.OffsiteEditor.framePhotoJPEGQuality) else {
+            throw StorageError.imageEncodingFailed
+        }
+        try jpegData.write(to: fileURL)
+        logger.info("Frame image guardada: \(filename)")
+        return filename
+    }
+
+    func loadFrameImage(captureId: String, filename: String) -> UIImage? {
+        let fileURL = framesDirectory(for: captureId).appendingPathComponent(filename)
+        guard let data = try? Data(contentsOf: fileURL) else { return nil }
+        return UIImage(data: data)
+    }
+
+    func deleteFrameImage(captureId: String, filename: String) {
+        let fileURL = framesDirectory(for: captureId).appendingPathComponent(filename)
+        try? fileManager.removeItem(at: fileURL)
+    }
+
     // MARK: - Helpers
 
     private func thumbnailURL(for imageURL: URL) -> URL {
@@ -232,6 +274,16 @@ final class MockStorageService: StorageServiceProtocol, @unchecked Sendable {
             baseName: baseName
         )
     }
+
+    func saveFrameImage(_ image: UIImage, captureId: String, frameId: UUID) throws -> String {
+        "\(frameId.uuidString).jpg"
+    }
+
+    func loadFrameImage(captureId: String, filename: String) -> UIImage? {
+        nil
+    }
+
+    func deleteFrameImage(captureId: String, filename: String) {}
 
     func reset() {
         mockEntries = []

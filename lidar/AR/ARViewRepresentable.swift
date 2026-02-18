@@ -21,7 +21,8 @@ struct ARViewRepresentable: UIViewControllerRepresentable {
     func updateUIViewController(_ uiViewController: ARViewController, context: Context) {
         let scale = sceneManager.isMeasurementMode ? CGFloat(sceneManager.measurementZoomScale) : 1.0
         uiViewController.applyZoom(scale: scale)
-        
+        uiViewController.syncDebugOptions(sceneManager: sceneManager)
+
         // Deshabilitar interacción con AR cuando hay UI visible
         uiViewController.arViewInteractionEnabled = true
     }
@@ -49,7 +50,7 @@ final class ARViewController: UIViewController {
         let coaching = ARCoachingOverlayView()
         coaching.session = arSCNView.session
         coaching.delegate = self
-        coaching.goal = .horizontalPlane
+        coaching.goal = .anyPlane
         coaching.activatesAutomatically = true
         coaching.translatesAutoresizingMaskIntoConstraints = false
         arSCNView.addSubview(coaching)
@@ -76,6 +77,16 @@ final class ARViewController: UIViewController {
         currentScale = scale
         UIView.animate(withDuration: 0.2, delay: 0, options: .curveEaseInOut) {
             arView.transform = CGAffineTransform(scaleX: scale, y: scale)
+        }
+    }
+
+    /// Sincroniza las opciones de debug de la vista AR con el estado del sceneManager.
+    func syncDebugOptions(sceneManager: ARSceneManager) {
+        guard let arView = arView else { return }
+        if sceneManager.showFeaturePoints {
+            arView.debugOptions.insert(.showFeaturePoints)
+        } else {
+            arView.debugOptions.remove(.showFeaturePoints)
         }
     }
 
@@ -131,6 +142,9 @@ final class ARViewController: UIViewController {
                 let position = result.worldTransform.position
                 if let moveId = sceneManager.moveModeForFrameId {
                     sceneManager.moveFrame(id: moveId, to: position, planeAnchor: anchor)
+                    HapticService.shared.notification(type: .success)
+                } else if sceneManager.isVinylMode, let wallAnchor = anchor, wallAnchor.alignment == .vertical {
+                    sceneManager.placeVinyl(on: wallAnchor)
                     HapticService.shared.notification(type: .success)
                 } else {
                     sceneManager.placeFrame(at: position, on: anchor)

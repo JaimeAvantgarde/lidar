@@ -28,6 +28,8 @@ final class ARSceneManager: NSObject {
     var moveModeForFrameId: UUID?
     /// Imagen seleccionada de la galería para los nuevos cuadros (y para sustituir en uno existente).
     var selectedFrameImage: UIImage?
+    /// Si true, el próximo tap en una pared coloca un vinilo que cubre toda la superficie detectada.
+    var isVinylMode: Bool = false
 
     // MARK: - Medidas
     /// Si true, los toques en AR registran puntos para medir distancia (no colocan cuadros).
@@ -56,6 +58,10 @@ final class ARSceneManager: NSObject {
     var showPlaneOverlays: Bool = false
     /// Si true, se muestran marcadores en las esquinas detectadas.
     var showCornerMarkers: Bool = false
+    /// Si true, se muestra el wireframe del mesh LiDAR reconstruido.
+    var showMeshWireframe: Bool = false
+    /// Si true, se muestran los feature points de tracking ARKit.
+    var showFeaturePoints: Bool = false
     /// Si true, los puntos de medición se ajustan a bordes/esquinas cercanos.
     var snapToEdgesEnabled: Bool = true
     /// Si true, los cuadros se colocan alineados al plano (sin billboard).
@@ -72,6 +78,8 @@ final class ARSceneManager: NSObject {
     private var cornerMarkerNodes: [SCNNode] = []
     /// Nodo de marcador de snap temporal.
     private var snapMarkerNode: SCNNode?
+    /// Nodos del mesh LiDAR por anchor identifier.
+    private var meshNodes: [UUID: SCNNode] = [:]
 
     /// Alias: misma lista que detectedPlanes, para uso más explícito.
     var detectedPlaneAnchors: [ARPlaneAnchor] { detectedPlanes }
@@ -103,15 +111,22 @@ final class ARSceneManager: NSObject {
         isLiDARAvailable = ARWorldTrackingConfiguration.supportsSceneReconstruction(.mesh)
     }
     
-    /// Iniciar sesión AR: planos horizontales y verticales, opcional mesh LiDAR
+    /// Iniciar sesión AR: planos horizontales y verticales, mesh LiDAR con clasificación, scene depth suavizado.
     func startSession() {
         guard let sceneView = sceneView else { return }
         configuration.planeDetection = [.horizontal, .vertical]
         configuration.environmentTexturing = .automatic
         if isLiDARAvailable {
-            configuration.sceneReconstruction = .mesh
-            // Solo pedir sceneDepth si LiDAR está disponible (crash en dispositivos sin LiDAR)
-            if ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth) {
+            // Mesh con clasificación semántica (pared, suelo, techo, puerta, ventana)
+            if ARWorldTrackingConfiguration.supportsSceneReconstruction(.meshWithClassification) {
+                configuration.sceneReconstruction = .meshWithClassification
+            } else {
+                configuration.sceneReconstruction = .mesh
+            }
+            // Smoothed depth para mejor calidad (temporal smoothing reduce ruido)
+            if ARWorldTrackingConfiguration.supportsFrameSemantics(.smoothedSceneDepth) {
+                configuration.frameSemantics.insert(.smoothedSceneDepth)
+            } else if ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth) {
                 configuration.frameSemantics.insert(.sceneDepth)
             }
         }
@@ -156,6 +171,35 @@ final class ARSceneManager: NSObject {
         }
     }
     
+    /// Coloca un vinilo (imagen) que cubre toda la superficie de la pared detectada.
+    func placeVinyl(on planeAnchor: ARPlaneAnchor) {
+        guard planeAnchor.alignment == .vertical else { return }
+        let image = selectedFrameImage
+
+        // Usar las dimensiones completas del plano detectado
+        let size = CGSize(width: CGFloat(planeAnchor.extent.x), height: CGFloat(planeAnchor.extent.z))
+
+        // Centro del plano en coordenadas mundo
+        let t = planeAnchor.transform
+        let center = SIMD3<Float>(t.columns.3.x, t.columns.3.y, t.columns.3.z)
+
+        let frameNode = createFrameNode(size: size, image: image, alignToSurface: true)
+        frameNode.constraints = nil
+        frameNode.simdOrientation = orientationForPlane(anchor: planeAnchor)
+
+        // Offset ligeramente fuera de la pared para evitar z-fighting
+        let normal = planeNormal(planeAnchor)
+        frameNode.simdPosition = center + normal * 0.005
+
+        let placed = PlacedFrame(node: frameNode, planeAnchor: planeAnchor, size: size, image: image, isCornerFrame: false)
+        sceneView?.scene.rootNode.addChildNode(frameNode)
+        placedFrames.append(placed)
+        selectedFrameId = placed.id
+        selectedPlaneAnchor = planeAnchor
+
+        isVinylMode = false
+    }
+
     /// Mover un cuadro a una nueva posición (y opcionalmente reorientar al plano; esquina solo mueve posición).
     func moveFrame(id: UUID, to position: SIMD3<Float>, planeAnchor: ARPlaneAnchor? = nil) {
         guard let index = placedFrames.firstIndex(where: { $0.id == id }) else { return }
@@ -1235,12 +1279,65 @@ final class ARSceneManager: NSObject {
          t.columns.3.x, t.columns.3.y, t.columns.3.z, t.columns.3.w]
     }
 
+    // MARK: - Mesh LiDAR
+
+    /// Actualiza la visibilidad del wireframe del mesh.
+    func updateMeshVisibility() {
+        for (_, node) in meshNodes {
+            node.isHidden = !showMeshWireframe
+        }
+    }
+
+    /// Actualiza la visibilidad de los feature points en la escena.
+    func updateFeaturePointsVisibility() {
+        guard let sceneView = sceneView else { return }
+        if showFeaturePoints {
+            sceneView.debugOptions.insert(.showFeaturePoints)
+        } else {
+            sceneView.debugOptions.remove(.showFeaturePoints)
+        }
+    }
+
+    /// Crea geometría SCNGeometry desde un ARMeshGeometry (wireframe del LiDAR).
+    private func createMeshGeometry(from meshGeometry: ARMeshGeometry) -> SCNGeometry {
+        let verticesSource = SCNGeometrySource(
+            buffer: meshGeometry.vertices.buffer,
+            vertexFormat: meshGeometry.vertices.format,
+            semantic: .vertex,
+            vertexCount: meshGeometry.vertices.count,
+            dataOffset: meshGeometry.vertices.offset,
+            dataStride: meshGeometry.vertices.stride
+        )
+
+        let facesData = Data(
+            bytesNoCopy: meshGeometry.faces.buffer.contents(),
+            count: meshGeometry.faces.buffer.length,
+            deallocator: .none
+        )
+        let facesElement = SCNGeometryElement(
+            data: facesData,
+            primitiveType: .triangles,
+            primitiveCount: meshGeometry.faces.count,
+            bytesPerIndex: meshGeometry.faces.bytesPerIndex
+        )
+
+        let geometry = SCNGeometry(sources: [verticesSource], elements: [facesElement])
+        let material = SCNMaterial()
+        material.fillMode = .lines
+        material.diffuse.contents = UIColor.cyan.withAlphaComponent(0.4)
+        material.isDoubleSided = true
+        material.lightingModel = .constant
+        geometry.materials = [material]
+        return geometry
+    }
+
     // MARK: - Helpers
 
-    /// Normal del plano (apunta hacia fuera de la pared). Para plano vertical suele ser column.2.
+    /// Normal del plano (apunta hacia fuera de la superficie).
+    /// En ARKit, el eje Y del anchor (columns.1) es siempre la normal del plano.
     private func planeNormal(_ anchor: ARPlaneAnchor) -> SIMD3<Float> {
         let t = anchor.transform
-        return SIMD3<Float>(t.columns.2.x, t.columns.2.y, t.columns.2.z)
+        return simd_normalize(SIMD3<Float>(t.columns.1.x, t.columns.1.y, t.columns.1.z))
     }
 
     /// Orientación según la superficie: pared = perpendicular mirando hacia fuera;
@@ -1261,8 +1358,8 @@ final class ARSceneManager: NSObject {
     /// Pared: cuadro vertical mirando hacia fuera de la pared, con el "arriba" del marco hacia el techo.
     private func orientationForVerticalPlane(anchor: ARPlaneAnchor) -> simd_quatf {
         let t = anchor.transform
-        // Normal del plano (apunta hacia fuera de la pared)
-        let N = simd_normalize(SIMD3<Float>(t.columns.2.x, t.columns.2.y, t.columns.2.z))
+        // Normal del plano = eje Y del anchor (columns.1) en ARKit
+        let N = simd_normalize(SIMD3<Float>(t.columns.1.x, t.columns.1.y, t.columns.1.z))
         let worldUp = SIMD3<Float>(0, 1, 0)
         
         // Y del cuadro = up (world up proyectado para ser perpendicular a la normal)
@@ -1510,44 +1607,65 @@ final class ARSceneManager: NSObject {
 extension ARSceneManager: ARSCNViewDelegate {
     
     func renderer(_ renderer: SCNSceneRenderer, didAdd node: SCNNode, for anchor: ARAnchor) {
-        guard let planeAnchor = anchor as? ARPlaneAnchor else { return }
-        Task { @MainActor in
-            if !detectedPlanes.contains(where: { $0.identifier == planeAnchor.identifier }) {
-                detectedPlanes.append(planeAnchor)
-            }
-            let extent = planeAnchor.extent
-            lastPlaneDimensions = PlaneDimensions(width: extent.x, height: extent.z, extent: extent)
-            
-            // Actualizar visualizaciones
-            updatePlaneOverlays()
-            detectAllCorners()
-        }
-    }
-    
-    func renderer(_ renderer: SCNSceneRenderer, didUpdate node: SCNNode, for anchor: ARAnchor) {
-        guard let planeAnchor = anchor as? ARPlaneAnchor else { return }
-        Task { @MainActor in
-            if let idx = detectedPlanes.firstIndex(where: { $0.identifier == planeAnchor.identifier }) {
-                detectedPlanes[idx] = planeAnchor
-            }
-            let extent = planeAnchor.extent
-            lastPlaneDimensions = PlaneDimensions(width: extent.x, height: extent.z, extent: extent)
-            
-            // Actualizar visualizaciones en cada actualización de plano
-            updatePlaneOverlays()
-            // Detectar esquinas periódicamente (cada 5 actualizaciones para performance)
-            if detectedPlanes.count > 1 {
+        if let planeAnchor = anchor as? ARPlaneAnchor {
+            Task { @MainActor in
+                if !detectedPlanes.contains(where: { $0.identifier == planeAnchor.identifier }) {
+                    detectedPlanes.append(planeAnchor)
+                }
+                let extent = planeAnchor.extent
+                lastPlaneDimensions = PlaneDimensions(width: extent.x, height: extent.z, extent: extent)
+
+                // Actualizar visualizaciones
+                updatePlaneOverlays()
                 detectAllCorners()
             }
+        } else if let meshAnchor = anchor as? ARMeshAnchor {
+            Task { @MainActor in
+                let meshNode = SCNNode(geometry: createMeshGeometry(from: meshAnchor.geometry))
+                meshNode.isHidden = !showMeshWireframe
+                node.addChildNode(meshNode)
+                meshNodes[meshAnchor.identifier] = meshNode
+            }
         }
     }
-    
+
+    func renderer(_ renderer: SCNSceneRenderer, didUpdate node: SCNNode, for anchor: ARAnchor) {
+        if let planeAnchor = anchor as? ARPlaneAnchor {
+            Task { @MainActor in
+                if let idx = detectedPlanes.firstIndex(where: { $0.identifier == planeAnchor.identifier }) {
+                    detectedPlanes[idx] = planeAnchor
+                }
+                let extent = planeAnchor.extent
+                lastPlaneDimensions = PlaneDimensions(width: extent.x, height: extent.z, extent: extent)
+
+                // Actualizar visualizaciones en cada actualización de plano
+                updatePlaneOverlays()
+                // Detectar esquinas periódicamente
+                if detectedPlanes.count > 1 {
+                    detectAllCorners()
+                }
+            }
+        } else if let meshAnchor = anchor as? ARMeshAnchor {
+            Task { @MainActor in
+                guard let meshNode = meshNodes[meshAnchor.identifier] else { return }
+                meshNode.geometry = createMeshGeometry(from: meshAnchor.geometry)
+                meshNode.isHidden = !showMeshWireframe
+            }
+        }
+    }
+
     func renderer(_ renderer: SCNSceneRenderer, didRemove node: SCNNode, for anchor: ARAnchor) {
-        guard let planeAnchor = anchor as? ARPlaneAnchor else { return }
-        Task { @MainActor in
-            detectedPlanes.removeAll { $0.identifier == planeAnchor.identifier }
-            updatePlaneOverlays()
-            detectAllCorners()
+        if let planeAnchor = anchor as? ARPlaneAnchor {
+            Task { @MainActor in
+                detectedPlanes.removeAll { $0.identifier == planeAnchor.identifier }
+                updatePlaneOverlays()
+                detectAllCorners()
+            }
+        } else if let meshAnchor = anchor as? ARMeshAnchor {
+            Task { @MainActor in
+                meshNodes[meshAnchor.identifier]?.removeFromParentNode()
+                meshNodes.removeValue(forKey: meshAnchor.identifier)
+            }
         }
     }
 

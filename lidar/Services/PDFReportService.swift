@@ -136,6 +136,7 @@ final class PDFReportService {
             try data.write(to: tempURL)
             return tempURL
         } catch {
+            print("Error guardando PDF: \(error.localizedDescription)")
             return nil
         }
     }

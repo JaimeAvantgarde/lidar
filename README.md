@@ -222,38 +222,141 @@ await hapticService.impact(style: .light)
 
 **Nota:** ARKit no funciona en simulador; hace falta dispositivo real.
 
+## Guia de uso
+
+### Paso 1: Escaneo inicial (30-60 segundos)
+
+La calidad de todo lo que hagas despues depende de un buen escaneo. Dedica tiempo a esta fase.
+
+1. Abre la app y **mueve el dispositivo lentamente** apuntando al **suelo** primero — esto establece el tracking base
+2. Luego **escanea las paredes** con un movimiento horizontal suave, de izquierda a derecha, cubriendo toda la superficie
+3. Manten el dispositivo a **1-2 metros** de la pared. Demasiado cerca o lejos reduce la precision
+4. **No te muevas rapido** — movimientos bruscos degradan el tracking y generan mesh de baja calidad
+5. Espera a que aparezcan los contadores de planos en el badge superior
+
+**Tips de escaneo:**
+- Empieza siempre por el suelo, luego paredes, luego techo
+- Las esquinas (donde dos paredes se juntan) requieren escaneo mas lento para que se detecten bien
+- Si un plano no aparece, alejate un poco y vuelve a apuntar
+
+### Paso 2: Verificar la deteccion
+
+Antes de medir o colocar cuadros, verifica que la app ha entendido el espacio.
+
+1. Ve a la pestana **Planos**
+2. Activa **"Planos"** (toggle azul) — veras rectangulos semitransparentes sobre las superficies detectadas
+3. Si tienes LiDAR, activa **"Malla 3D"** (toggle cyan) — veras el wireframe completo de la reconstruccion 3D. Donde hay malla, hay datos precisos
+4. Activa **"Puntos de tracking"** (toggle naranja) — los puntos amarillos indican donde ARKit tiene buena referencia visual. Si hay zonas sin puntos, escanealas mas
+5. Revisa la lista de planos detectados: comprueba que las dimensiones (ancho x alto) tienen sentido
+
+**Indicadores de buena deteccion:**
+- Paredes cubiertas con overlay azul
+- Esquinas detectadas (aparecen en la seccion de esquinas con angulo ~90°)
+- Malla 3D densa y uniforme (sin huecos grandes)
+
+### Paso 3: Medir distancias
+
+1. Ve a la pestana **Medidas** → toca **"Medir distancia"**
+2. La app entra en modo medicion (hint flotante lo indica)
+3. Apunta al primer punto y **toca la pantalla** — aparece un marcador naranja
+4. Apunta al segundo punto y **toca** — aparece la linea verde con la distancia
+5. La medicion queda guardada en la lista inferior
+
+**Precision maxima:**
+- Activa **"Snap a bordes"** en la seccion Planos — los puntos se ajustan automaticamente a bordes y esquinas de los planos detectados (marcador amarillo = esquina, cyan = borde)
+- Usa el **slider de zoom** (1.0x a 2.5x) para apuntar con mas precision a puntos lejanos
+- Con LiDAR la precision es ~1cm, sin LiDAR ~5cm
+
+### Paso 4: Colocar cuadros y vinilos
+
+**Cuadro normal (foto enmarcada en la pared):**
+1. Ve a la pestana **Cuadros**
+2. Toca **"Elegir foto"** y selecciona una imagen de la galeria
+3. Toca directamente en una pared en la vista AR — el cuadro se coloca ahi
+4. Usa el **slider de tamano** para ajustar
+5. **Long-press** sobre el cuadro para activar modo mover → toca la nueva posicion
+
+**Vinilo (imagen que cubre toda la pared):**
+1. Selecciona una foto de galeria
+2. Toca **"Cubrir pared"**
+3. Toca la pared en AR — la imagen se estira cubriendo toda la superficie detectada
+4. El modo se desactiva automaticamente despues de colocar
+
+**Cuadros en esquina (L):**
+- Si tocas cerca de donde dos paredes se juntan, la app automaticamente crea un cuadro en L que se adapta a ambas superficies
+
+### Paso 5: Capturar para edicion offsite
+
+Cuando tengas todo preparado (mediciones + cuadros + planos):
+
+1. Pulsa el **icono de camara** (arriba a la derecha)
+2. Se guarda: imagen alta resolucion + todos los datos 3D en JSON + thumbnail
+3. Aparece un resumen con lo que se ha capturado
+
+### Paso 6: Edicion offsite (sin AR)
+
+En la oficina o en casa, sin necesidad de volver al sitio:
+
+1. Toca el icono **"Ver capturas"** (arriba a la derecha)
+2. Selecciona una captura de la lista
+3. Toca **"Editar"** para activar las herramientas:
+   - **Seleccionar**: Toca y arrastra mediciones, cuadros o texto
+   - **Medir**: Anade mediciones nuevas (usa la escala AR de referencia)
+   - **Cuadro**: Anade marcos rectangulares de colores
+   - **Colocar en pared**: Coloca cuadros con perspectiva sobre paredes detectadas
+   - **Texto**: Anade anotaciones de texto
+4. **Undo/Redo** con los botones de la barra inferior (hasta 20 niveles)
+5. **Guarda** los cambios o **cancela** para restaurar el estado original
+
+### Consejos avanzados
+
+**Iluminacion:**
+- Interior con luz uniforme es ideal
+- Evita luz directa del sol sobre el sensor LiDAR (en la parte trasera del dispositivo)
+- Superficies muy brillantes o espejos pueden confundir el tracking
+
+**Superficies dificiles:**
+- Paredes lisas y completamente blancas son mas dificiles de detectar — activa "Puntos de tracking" para verificar
+- Superficies transparentes (cristal, vidrio) no se detectan bien
+- Superficies muy oscuras o absorbentes reducen la calidad del LiDAR
+
+**Rendimiento:**
+- Si la app va lenta, desactiva la malla 3D y los feature points (son solo para verificacion)
+- Los overlays de planos tambien consumen recursos — desactivalos cuando no los necesites
+- Con muchas mediciones (>20), el render puede ralentizarse ligeramente
+
+**Flujo de trabajo recomendado:**
+1. Escaneo completo de la habitacion (1-2 minutos)
+2. Verificar deteccion con malla 3D y planos
+3. Desactivar visualizaciones de debug
+4. Realizar todas las mediciones necesarias
+5. Colocar cuadros/vinilos donde se necesiten
+6. Capturar para offsite
+7. Editar y anotar en la oficina
+
 ## Casos de uso
 
-### 📐 Medición en obra
+### Medicion en obra
 1. Abre la app en tablet iPad 13" con LiDAR
-2. Apunta a la pared/espacio que quieres medir
-3. Ve a sección **Medidas** → **Medir distancia**
-4. Ajusta zoom (1.0× a 2.5×) para mayor precisión
-5. Toca primer punto (marcador naranja aparece)
-6. Toca segundo punto (línea verde + distancia)
-7. Repite para múltiples mediciones
-8. **Capturar para offsite** → guarda todo
+2. Escanea el espacio siguiendo los pasos anteriores
+3. Mide todas las distancias necesarias con snap a bordes
+4. Captura para offsite → lleva las mediciones a la oficina
 
-### 📸 Revisión y edición offsite
-1. En oficina/casa, abre la app
-2. Toca icono **Ver capturas offsite**
-3. Selecciona la captura guardada
-4. Revisa todas las mediciones sobre la foto
-5. **Toca "Editar"** → Modo edición activado
-6. **Añade más mediciones**: Herramienta "Medir" → toca dos puntos
-7. **Marca áreas**: Herramienta "Cuadro" → toca para colocar marco
-8. **Añade notas**: Herramienta "Texto" → toca y escribe
-9. **Elimina elementos**: Botón X en cada elemento
-10. **Guarda cambios** o cancela
-11. Cambia entre m/ft según necesites
-12. Comparte imagen con cliente via ShareLink
+### Decoracion y planificacion de arte
+1. Escanea la habitacion
+2. Selecciona fotos de cuadros/arte de tu galeria
+3. Coloca en las paredes para visualizar como quedarian
+4. Usa "Cubrir pared" para probar vinilos decorativos
+5. Ajusta tamano hasta que se vea bien
+6. Captura la escena para presentar al cliente
 
-### 🖼️ Planificación de arte
-1. Coloca fotos de cuadros en paredes virtuales
-2. Visualiza cómo quedaría el artwork
-3. Ajusta tamaño con slider hasta que se vea bien
-4. Mueve con long press si necesitas reposicionar
-5. Captura la escena completa para presentar al cliente
+### Revision y documentacion offsite
+1. Captura la escena en obra
+2. En la oficina, abre la captura
+3. Anade mediciones adicionales que hayas olvidado
+4. Anota con texto las observaciones importantes
+5. Marca areas de interes con cuadros de colores
+6. Comparte con el equipo
 
 ## Configuración técnica
 

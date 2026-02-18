@@ -166,6 +166,32 @@ enum AppConstants {
         static let resizeIncrement: Double = 0.015
         /// Distancia para snap a borde de plano (normalizada)
         static let snapToPlaneEdge: Double = 0.03
+        /// Radio de hit test para seleccionar elementos (puntos)
+        static let hitTestRadius: CGFloat = 30
+        /// Radio de hit test para endpoints de medición (puntos)
+        static let endpointHitTestRadius: CGFloat = 25
+        /// Distancia mínima para iniciar drag (puntos)
+        static let minDragDistance: CGFloat = 5
+        /// Tamaño del handle visual de drag (puntos)
+        static let dragHandleSize: CGFloat = 28
+        /// Ancho del borde de selección (puntos)
+        static let selectionBorderWidth: CGFloat = 3
+        /// Mostrar overlays de planos por defecto
+        static let defaultShowPlaneOverlays = false
+        /// Mostrar marcadores de esquinas por defecto
+        static let defaultShowCornerMarkers = false
+        /// Mostrar cotas de paredes por defecto
+        static let defaultShowWallDimensions = false
+        /// Mostrar cuadros con perspectiva por defecto
+        static let defaultShowPerspectiveFrames = true
+        /// Calidad JPEG para fotos de cuadros
+        static let framePhotoJPEGQuality: CGFloat = 0.7
+        /// Dimensión máxima de foto de cuadro (pixeles)
+        static let framePhotoMaxDimension: CGFloat = 800
+        /// Escala mínima de zoom (1x = sin zoom)
+        static let minZoomScale: CGFloat = 1.0
+        /// Escala máxima de zoom
+        static let maxZoomScale: CGFloat = 5.0
     }
 
     // MARK: - Animation
