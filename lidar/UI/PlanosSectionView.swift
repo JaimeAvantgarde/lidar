@@ -10,6 +10,7 @@ import ARKit
 
 struct PlanosSectionView: View {
     var sceneManager: ARSceneManager
+    @State private var showFloorPlan = false
 
     var body: some View {
         ScrollView {
@@ -28,6 +29,27 @@ struct PlanosSectionView: View {
                     allPlanesBlock
                 }
                 
+                // Botón plano 2D
+                if sceneManager.detectedPlanes.contains(where: { $0.alignment == .vertical }) {
+                    Button {
+                        showFloorPlan = true
+                    } label: {
+                        Label("Generar plano 2D", systemImage: "map")
+                            .font(.subheadline)
+                            .fontWeight(.semibold)
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(.indigo)
+                    .sheet(isPresented: $showFloorPlan) {
+                        FloorPlanView(floorPlanData: FloorPlanGenerator.generate(
+                            from: sceneManager.detectedPlanes,
+                            classifyPlane: { sceneManager.classifyPlane($0) },
+                            roomSummary: sceneManager.estimateRoomSummary()
+                        ))
+                    }
+                }
+
                 // Esquinas detectadas
                 if !sceneManager.detectedCorners.isEmpty {
                     cornersBlock
@@ -151,6 +173,18 @@ struct PlanosSectionView: View {
                     }
                     .toggleStyle(.switch)
                     .tint(.cyan)
+                }
+
+                HStack(spacing: 12) {
+                    Toggle(isOn: Binding(
+                        get: { sceneManager.showDepthColorMesh },
+                        set: { sceneManager.showDepthColorMesh = $0; sceneManager.updateDepthMeshVisibility() }
+                    )) {
+                        Label("Nube de puntos", systemImage: "cloud.fill")
+                            .font(.subheadline)
+                    }
+                    .toggleStyle(.switch)
+                    .tint(.red)
                 }
             }
 

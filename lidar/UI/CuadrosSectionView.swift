@@ -184,6 +184,12 @@ struct CuadrosSectionView: View {
         }
         .navigationTitle("Cuadros")
         .navigationBarTitleDisplayMode(.inline)
+        .onChange(of: sceneManager.frameGestureUpdateCounter) { _, _ in
+            if let selectedId = sceneManager.selectedFrameId,
+               let frame = sceneManager.placedFrames.first(where: { $0.id == selectedId }) {
+                resizeValue = frame.size.width
+            }
+        }
         .sheet(isPresented: Binding(
             get: { frameIdToChangePhoto != nil },
             set: { if !$0 { frameIdToChangePhoto = nil } }

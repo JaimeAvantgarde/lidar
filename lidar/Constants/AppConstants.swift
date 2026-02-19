@@ -133,6 +133,10 @@ enum AppConstants {
         static let aspectRatio: CGFloat = 0.8
         /// Tamaño de reemplazo rápido
         static let replaceSize = CGSize(width: 0.6, height: 0.48)
+        /// Escala mínima de pinch (gesto AR)
+        static let minPinchScale: CGFloat = 0.5
+        /// Escala máxima de pinch (gesto AR)
+        static let maxPinchScale: CGFloat = 3.0
     }
 
     // MARK: - Offsite Editor
@@ -192,6 +196,38 @@ enum AppConstants {
         static let minZoomScale: CGFloat = 1.0
         /// Escala máxima de zoom
         static let maxZoomScale: CGFloat = 5.0
+    }
+
+    // MARK: - Point Cloud (Depth Mesh)
+
+    enum PointCloud {
+        /// Profundidad mínima para el gradiente de color (metros)
+        static let minDepth: Float = 0.3
+        /// Profundidad máxima para el gradiente de color (metros)
+        static let maxDepth: Float = 5.0
+        /// Alpha del mesh coloreado por profundidad
+        static let meshAlpha: Float = 0.7
+        /// Orden de renderizado (detrás de otros elementos)
+        static let renderingOrder: Int = -1
+    }
+
+    // MARK: - Floor Plan (Plano 2D)
+
+    enum FloorPlan {
+        /// Padding del canvas en puntos
+        static let canvasPadding: CGFloat = 40
+        /// Grosor mínimo de línea de pared
+        static let minWallLineWidth: CGFloat = 4
+        /// Offset de la etiqueta de dimensión desde el muro
+        static let dimensionLabelOffset: CGFloat = 20
+        /// Grosor por defecto de pared (metros)
+        static let defaultWallThickness: CGFloat = 0.15
+        /// Tamaño de la imagen exportada
+        static let exportImageSize: CGFloat = 1200
+        /// Espaciado de la cuadrícula (metros)
+        static let gridSpacing: CGFloat = 1.0
+        /// Padding del bounding box (metros)
+        static let boundsPadding: CGFloat = 0.3
     }
 
     // MARK: - Animation

@@ -34,6 +34,14 @@ final class ARViewController: UIViewController {
     private var coachingOverlay: ARCoachingOverlayView?
     private var currentScale: CGFloat = 1.0
     var arViewInteractionEnabled: Bool = true
+
+    // MARK: - Gesture state
+    /// Si true, el tap seleccionó un cuadro y touchesEnded debe ignorar el toque.
+    private var tapDidSelectFrame: Bool = false
+    /// Tamaño inicial del cuadro al comenzar el pinch.
+    private var pinchInitialSize: CGSize?
+    /// Ángulo de rotación del cuadro al comenzar el gesto de rotación.
+    private var rotationInitialAngle: Float = 0
     
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -69,6 +77,22 @@ final class ARViewController: UIViewController {
         longPress.minimumPressDuration = 0.5
         longPress.delegate = self
         arSCNView.addGestureRecognizer(longPress)
+
+        // Tap para seleccionar cuadros directamente en la escena 3D
+        let tap = UITapGestureRecognizer(target: self, action: #selector(handleTap(_:)))
+        tap.cancelsTouchesInView = false
+        tap.delegate = self
+        arSCNView.addGestureRecognizer(tap)
+
+        // Pinch para redimensionar el cuadro seleccionado
+        let pinch = UIPinchGestureRecognizer(target: self, action: #selector(handlePinch(_:)))
+        pinch.delegate = self
+        arSCNView.addGestureRecognizer(pinch)
+
+        // Rotación con 2 dedos para girar el cuadro seleccionado
+        let rotation = UIRotationGestureRecognizer(target: self, action: #selector(handleRotation(_:)))
+        rotation.delegate = self
+        arSCNView.addGestureRecognizer(rotation)
     }
 
     /// Aplica zoom visual por escala (1.0 = normal). Solo en modo medición se usa escala > 1.
@@ -108,6 +132,11 @@ final class ARViewController: UIViewController {
     }
     
     override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
+        // Si el tap gesture ya seleccionó un cuadro, no colocar uno nuevo
+        if tapDidSelectFrame {
+            tapDidSelectFrame = false
+            return
+        }
         guard arViewInteractionEnabled,
               let touch = touches.first,
               let arView = arView,
@@ -154,6 +183,74 @@ final class ARViewController: UIViewController {
         }
     }
 
+    // MARK: - Gesture Handlers
+
+    @objc private func handleTap(_ gesture: UITapGestureRecognizer) {
+        guard gesture.state == .ended,
+              let arView = arView,
+              let sceneManager = sceneManager else { return }
+        // Si hay move mode activo, dejar que touchesEnded lo maneje
+        if sceneManager.moveModeForFrameId != nil { return }
+        let location = gesture.location(in: arView)
+        let hitResults = arView.hitTest(location, options: [.searchMode: SCNHitTestSearchMode.all.rawValue])
+        for hit in hitResults {
+            if let frameId = sceneManager.frameId(containing: hit.node) {
+                sceneManager.selectedFrameId = frameId
+                tapDidSelectFrame = true
+                HapticService.shared.impact(style: .light)
+                return
+            }
+        }
+    }
+
+    @objc private func handlePinch(_ gesture: UIPinchGestureRecognizer) {
+        guard let sceneManager = sceneManager,
+              let selectedId = sceneManager.selectedFrameId,
+              !sceneManager.isMeasurementMode,
+              let frame = sceneManager.placedFrames.first(where: { $0.id == selectedId }) else { return }
+
+        switch gesture.state {
+        case .began:
+            pinchInitialSize = frame.size
+        case .changed:
+            guard let initialSize = pinchInitialSize else { return }
+            let scale = gesture.scale
+            let minScale = AppConstants.Cuadros.minPinchScale
+            let maxScale = AppConstants.Cuadros.maxPinchScale
+            let clampedScale = min(maxScale, max(minScale, CGFloat(scale)))
+            let newWidth = initialSize.width * clampedScale
+            let newHeight = initialSize.height * clampedScale
+            // Clamp al rango del slider
+            let clampedWidth = min(AppConstants.Cuadros.maxSize, max(AppConstants.Cuadros.minSize, newWidth))
+            let clampedHeight = clampedWidth * AppConstants.Cuadros.aspectRatio
+            sceneManager.resizeFrame(id: selectedId, newSize: CGSize(width: clampedWidth, height: clampedHeight))
+        case .ended, .cancelled:
+            pinchInitialSize = nil
+        default:
+            break
+        }
+    }
+
+    @objc private func handleRotation(_ gesture: UIRotationGestureRecognizer) {
+        guard let sceneManager = sceneManager,
+              let selectedId = sceneManager.selectedFrameId,
+              !sceneManager.isMeasurementMode,
+              let frame = sceneManager.placedFrames.first(where: { $0.id == selectedId }),
+              !frame.isCornerFrame else { return }
+
+        switch gesture.state {
+        case .began:
+            rotationInitialAngle = frame.rotationAngle
+        case .changed:
+            let newAngle = rotationInitialAngle - Float(gesture.rotation)
+            sceneManager.rotateFrame(id: selectedId, angle: newAngle)
+        case .ended, .cancelled:
+            break
+        default:
+            break
+        }
+    }
+
     // MARK: - Raycast Helper
 
     /// Realiza un raycast desde un punto de pantalla. Usa `ARSession.raycast` en lugar del deprecated `hitTest`.
@@ -186,6 +283,13 @@ extension ARViewController: UIGestureRecognizerDelegate {
             return false
         }
         return true
+    }
+
+    func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer) -> Bool {
+        // Permitir pinch + rotación simultáneos
+        let isPinch = gestureRecognizer is UIPinchGestureRecognizer || otherGestureRecognizer is UIPinchGestureRecognizer
+        let isRotation = gestureRecognizer is UIRotationGestureRecognizer || otherGestureRecognizer is UIRotationGestureRecognizer
+        return isPinch && isRotation
     }
 }
 

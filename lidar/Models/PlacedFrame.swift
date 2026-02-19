@@ -18,6 +18,8 @@ final class PlacedFrame: Identifiable {
     var image: UIImage?
     /// Si true, el cuadro tiene dos caras (esquina en L).
     var isCornerFrame: Bool
+    /// Ángulo de rotación aplicado por el usuario (radianes, alrededor del eje normal).
+    var rotationAngle: Float
 
     init(
         id: UUID = UUID(),
@@ -25,7 +27,8 @@ final class PlacedFrame: Identifiable {
         planeAnchor: ARPlaneAnchor? = nil,
         size: CGSize = AppConstants.AR.defaultFrameSize,
         image: UIImage? = nil,
-        isCornerFrame: Bool = false
+        isCornerFrame: Bool = false,
+        rotationAngle: Float = 0
     ) {
         self.id = id
         self.node = node
@@ -33,5 +36,6 @@ final class PlacedFrame: Identifiable {
         self.size = size
         self.image = image
         self.isCornerFrame = isCornerFrame
+        self.rotationAngle = rotationAngle
     }
 }

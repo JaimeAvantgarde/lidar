@@ -30,6 +30,8 @@ final class ARSceneManager: NSObject {
     var selectedFrameImage: UIImage?
     /// Si true, el próximo tap en una pared coloca un vinilo que cubre toda la superficie detectada.
     var isVinylMode: Bool = false
+    /// Contador para sincronizar el slider UI cuando se redimensiona/rota por gesto.
+    var frameGestureUpdateCounter: Int = 0
 
     // MARK: - Medidas
     /// Si true, los toques en AR registran puntos para medir distancia (no colocan cuadros).
@@ -60,6 +62,8 @@ final class ARSceneManager: NSObject {
     var showCornerMarkers: Bool = false
     /// Si true, se muestra el wireframe del mesh LiDAR reconstruido.
     var showMeshWireframe: Bool = false
+    /// Si true, se muestra el mesh LiDAR con color por profundidad (azul→verde→rojo).
+    var showDepthColorMesh: Bool = false
     /// Si true, se muestran los feature points de tracking ARKit.
     var showFeaturePoints: Bool = false
     /// Si true, los puntos de medición se ajustan a bordes/esquinas cercanos.
@@ -80,6 +84,8 @@ final class ARSceneManager: NSObject {
     private var snapMarkerNode: SCNNode?
     /// Nodos del mesh LiDAR por anchor identifier.
     private var meshNodes: [UUID: SCNNode] = [:]
+    /// Nodos del mesh coloreado por profundidad por anchor identifier.
+    private var depthMeshNodes: [UUID: SCNNode] = [:]
 
     /// Alias: misma lista que detectedPlanes, para uso más explícito.
     var detectedPlaneAnchors: [ARPlaneAnchor] { detectedPlanes }
@@ -224,8 +230,29 @@ final class ARSceneManager: NSObject {
         let placed = placedFrames[index]
         placed.size = newSize
         updateFrameGeometry(node: placed.node, size: newSize)
+        frameGestureUpdateCounter += 1
     }
     
+    /// Rotar un cuadro alrededor de su eje normal.
+    func rotateFrame(id: UUID, angle: Float) {
+        guard let index = placedFrames.firstIndex(where: { $0.id == id }) else { return }
+        let placed = placedFrames[index]
+        guard !placed.isCornerFrame else { return }
+        placed.rotationAngle = angle
+        if let anchor = placed.planeAnchor {
+            // Orientación base del plano + rotación del usuario alrededor de la normal
+            let baseOrientation = orientationForPlane(anchor: anchor)
+            let normal = planeNormal(anchor)
+            let userRotation = simd_quatf(angle: angle, axis: normal)
+            placed.node.simdOrientation = userRotation * baseOrientation
+        } else {
+            // Sin plano: quitar billboard y rotar alrededor de Z local
+            placed.node.constraints = nil
+            placed.node.eulerAngles.z = angle
+        }
+        frameGestureUpdateCounter += 1
+    }
+
     /// Eliminar un cuadro
     func deleteFrame(id: UUID) {
         guard let index = placedFrames.firstIndex(where: { $0.id == id }) else { return }
@@ -1288,6 +1315,13 @@ final class ARSceneManager: NSObject {
         }
     }
 
+    /// Actualiza la visibilidad del mesh coloreado por profundidad.
+    func updateDepthMeshVisibility() {
+        for (_, node) in depthMeshNodes {
+            node.isHidden = !showDepthColorMesh
+        }
+    }
+
     /// Actualiza la visibilidad de los feature points en la escena.
     func updateFeaturePointsVisibility() {
         guard let sceneView = sceneView else { return }
@@ -1296,6 +1330,100 @@ final class ARSceneManager: NSObject {
         } else {
             sceneView.debugOptions.remove(.showFeaturePoints)
         }
+    }
+
+    /// Crea geometría SCNGeometry desde un ARMeshGeometry con color por profundidad.
+    /// Cada vértice se colorea según su distancia a la cámara: azul (cerca) → verde → rojo (lejos).
+    private func createDepthColoredMeshGeometry(from meshGeometry: ARMeshGeometry, cameraPosition: SIMD3<Float>, anchorTransform: simd_float4x4) -> SCNGeometry {
+        let vertexCount = meshGeometry.vertices.count
+        let stride = meshGeometry.vertices.stride
+        let offset = meshGeometry.vertices.offset
+        let buffer = meshGeometry.vertices.buffer
+
+        // Leer vértices y calcular colores por profundidad
+        var colorData = Data(count: vertexCount * 4) // RGBA UInt8
+        let vertexPointer = buffer.contents().advanced(by: offset)
+
+        for i in 0..<vertexCount {
+            let vertexPtr = vertexPointer.advanced(by: i * stride)
+            let localPos = vertexPtr.assumingMemoryBound(to: SIMD3<Float>.self).pointee
+
+            // Convertir a coordenadas mundo usando el transform del anchor
+            let worldPos4 = anchorTransform * SIMD4<Float>(localPos.x, localPos.y, localPos.z, 1.0)
+            let worldPos = SIMD3<Float>(worldPos4.x, worldPos4.y, worldPos4.z)
+
+            // Distancia a la cámara
+            let distance = simd_distance(worldPos, cameraPosition)
+            let minD = AppConstants.PointCloud.minDepth
+            let maxD = AppConstants.PointCloud.maxDepth
+            let t = max(0, min(1, (distance - minD) / (maxD - minD)))
+
+            // Mapear a color: azul → verde → rojo
+            let r: UInt8
+            let g: UInt8
+            let b: UInt8
+            if t < 0.5 {
+                let s = t * 2.0 // 0..1
+                r = 0
+                g = UInt8(s * 255)
+                b = UInt8((1.0 - s) * 255)
+            } else {
+                let s = (t - 0.5) * 2.0 // 0..1
+                r = UInt8(s * 255)
+                g = UInt8((1.0 - s) * 255)
+                b = 0
+            }
+            let alpha = UInt8(AppConstants.PointCloud.meshAlpha * 255)
+
+            let byteOffset = i * 4
+            colorData[byteOffset] = r
+            colorData[byteOffset + 1] = g
+            colorData[byteOffset + 2] = b
+            colorData[byteOffset + 3] = alpha
+        }
+
+        // Sources
+        let verticesSource = SCNGeometrySource(
+            buffer: meshGeometry.vertices.buffer,
+            vertexFormat: meshGeometry.vertices.format,
+            semantic: .vertex,
+            vertexCount: vertexCount,
+            dataOffset: meshGeometry.vertices.offset,
+            dataStride: meshGeometry.vertices.stride
+        )
+
+        let colorSource = SCNGeometrySource(
+            data: colorData,
+            semantic: .color,
+            vectorCount: vertexCount,
+            usesFloatComponents: false,
+            componentsPerVector: 4,
+            bytesPerComponent: 1,
+            dataOffset: 0,
+            dataStride: 4
+        )
+
+        // Faces
+        let facesData = Data(
+            bytesNoCopy: meshGeometry.faces.buffer.contents(),
+            count: meshGeometry.faces.buffer.length,
+            deallocator: .none
+        )
+        let facesElement = SCNGeometryElement(
+            data: facesData,
+            primitiveType: .triangles,
+            primitiveCount: meshGeometry.faces.count,
+            bytesPerIndex: meshGeometry.faces.bytesPerIndex
+        )
+
+        let geometry = SCNGeometry(sources: [verticesSource, colorSource], elements: [facesElement])
+        let material = SCNMaterial()
+        material.fillMode = .fill
+        material.isDoubleSided = true
+        material.lightingModel = .constant
+        material.blendMode = .alpha
+        geometry.materials = [material]
+        return geometry
     }
 
     /// Crea geometría SCNGeometry desde un ARMeshGeometry (wireframe del LiDAR).
@@ -1625,6 +1753,15 @@ extension ARSceneManager: ARSCNViewDelegate {
                 meshNode.isHidden = !showMeshWireframe
                 node.addChildNode(meshNode)
                 meshNodes[meshAnchor.identifier] = meshNode
+
+                // Nodo de mesh coloreado por profundidad
+                let cameraPos = sceneView?.session.currentFrame?.camera.transform.columns.3 ?? SIMD4<Float>(0, 0, 0, 1)
+                let camPosition = SIMD3<Float>(cameraPos.x, cameraPos.y, cameraPos.z)
+                let depthNode = SCNNode(geometry: createDepthColoredMeshGeometry(from: meshAnchor.geometry, cameraPosition: camPosition, anchorTransform: meshAnchor.transform))
+                depthNode.isHidden = !showDepthColorMesh
+                depthNode.renderingOrder = AppConstants.PointCloud.renderingOrder
+                node.addChildNode(depthNode)
+                depthMeshNodes[meshAnchor.identifier] = depthNode
             }
         }
     }
@@ -1650,6 +1787,14 @@ extension ARSceneManager: ARSCNViewDelegate {
                 guard let meshNode = meshNodes[meshAnchor.identifier] else { return }
                 meshNode.geometry = createMeshGeometry(from: meshAnchor.geometry)
                 meshNode.isHidden = !showMeshWireframe
+
+                // Actualizar depth mesh
+                if let depthNode = depthMeshNodes[meshAnchor.identifier] {
+                    let cameraPos = sceneView?.session.currentFrame?.camera.transform.columns.3 ?? SIMD4<Float>(0, 0, 0, 1)
+                    let camPosition = SIMD3<Float>(cameraPos.x, cameraPos.y, cameraPos.z)
+                    depthNode.geometry = createDepthColoredMeshGeometry(from: meshAnchor.geometry, cameraPosition: camPosition, anchorTransform: meshAnchor.transform)
+                    depthNode.isHidden = !showDepthColorMesh
+                }
             }
         }
     }
@@ -1665,6 +1810,8 @@ extension ARSceneManager: ARSCNViewDelegate {
             Task { @MainActor in
                 meshNodes[meshAnchor.identifier]?.removeFromParentNode()
                 meshNodes.removeValue(forKey: meshAnchor.identifier)
+                depthMeshNodes[meshAnchor.identifier]?.removeFromParentNode()
+                depthMeshNodes.removeValue(forKey: meshAnchor.identifier)
             }
         }
     }

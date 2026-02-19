@@ -115,6 +115,7 @@ struct OffsiteCaptureDetailView: View {
     @State private var viewModel: OffsiteCaptureDetailViewModel
 
     // MARK: - Local UI State
+    @State private var showFloorPlan = false
     @State private var showImagePicker = false
     @State private var selectedImage: UIImage?
     @State private var showPlaneOverlays: Bool = AppConstants.OffsiteEditor.defaultShowPlaneOverlays
@@ -202,6 +203,17 @@ struct OffsiteCaptureDetailView: View {
                 ToolbarItem(placement: .secondaryAction) {
                     ShareLink(item: viewModel.entry.imageURL, preview: SharePreview("Captura \(viewModel.entry.capturedAt.formatted(date: .abbreviated, time: .shortened))", image: Image(systemName: "photo"))) {
                         Label("Compartir", systemImage: "square.and.arrow.up")
+                    }
+                }
+
+                ToolbarItem(placement: .secondaryAction) {
+                    if let snapshot = viewModel.data?.sceneSnapshot,
+                       snapshot.planes.contains(where: { $0.isVertical }) {
+                        Button {
+                            showFloorPlan = true
+                        } label: {
+                            Label("Plano 2D", systemImage: "map")
+                        }
                     }
                 }
             } else {
@@ -305,6 +317,11 @@ struct OffsiteCaptureDetailView: View {
         }
         .sheet(isPresented: $showImagePicker) {
             ImagePicker(selectedImage: $selectedImage)
+        }
+        .sheet(isPresented: $showFloorPlan) {
+            if let snapshot = viewModel.data?.sceneSnapshot {
+                FloorPlanView(floorPlanData: FloorPlanGenerator.generate(from: snapshot.planes))
+            }
         }
         .onChange(of: selectedImage) { _, newImage in
             if let image = newImage, let frameId = viewModel.selectedFrameId {
