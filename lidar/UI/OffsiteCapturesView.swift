@@ -118,6 +118,7 @@ struct OffsiteCaptureDetailView: View {
     @State private var showFloorPlan = false
     @State private var showImagePicker = false
     @State private var selectedImage: UIImage?
+    @State private var frameIdForPhotoPicker: UUID?
     @State private var showPlaneOverlays: Bool = AppConstants.OffsiteEditor.defaultShowPlaneOverlays
     @State private var showCornerMarkers: Bool = AppConstants.OffsiteEditor.defaultShowCornerMarkers
     @State private var showWallDimensions: Bool = AppConstants.OffsiteEditor.defaultShowWallDimensions
@@ -125,10 +126,14 @@ struct OffsiteCaptureDetailView: View {
     @State private var selectedPlaneId: String?
     @State private var overlayOpacity: Double = 1.0
     @State private var showDeleteConfirmation = false
+    @State private var shareItem: URL?
     @State private var zoomScale: CGFloat = 1.0
     @State private var lastZoomScale: CGFloat = 1.0
     @State private var panOffset: CGSize = .zero
     @State private var lastPanOffset: CGSize = .zero
+    @State private var currentFingerPosition: CGPoint?
+    @State private var activeTouchPosition: CGPoint?
+    @State private var activeTouchNormalized: CGPoint?
 
     init(entry: OffsiteCaptureEntry) {
         _viewModel = State(initialValue: OffsiteCaptureDetailViewModel(entry: entry))
@@ -146,7 +151,7 @@ struct OffsiteCaptureDetailView: View {
                             .aspectRatio(contentMode: .fit)
                             .frame(maxWidth: .infinity, maxHeight: .infinity)
                         if let data = viewModel.data {
-                            overlaysView(data: data, viewSize: fullGeo.size, imageSize: image.size)
+                            overlaysView(data: data, viewSize: fullGeo.size, imageSize: image.size, zoomScale: zoomScale)
                         }
                     }
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -160,6 +165,24 @@ struct OffsiteCaptureDetailView: View {
                 } else {
                     ProgressView("Cargando\u{2026}")
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
+                }
+
+                // Magnifier lens (fuera del ZStack con zoom para que no escale)
+                if viewModel.isEditMode,
+                   let touchPos = activeTouchPosition,
+                   let touchNorm = activeTouchNormalized,
+                   let sourceImage = viewModel.image {
+                    let magnifierY = max(
+                        AppConstants.OffsiteEditor.magnifierDiameter / 2 + 10,
+                        touchPos.y - AppConstants.OffsiteEditor.magnifierOffsetY
+                    )
+                    MagnifierLensView(
+                        sourceImage: sourceImage,
+                        touchNormalized: touchNorm
+                    )
+                    .position(x: touchPos.x, y: magnifierY)
+                    .allowsHitTesting(false)
+                    .transition(.opacity)
                 }
             }
         }
@@ -201,7 +224,11 @@ struct OffsiteCaptureDetailView: View {
                 }
 
                 ToolbarItem(placement: .secondaryAction) {
-                    ShareLink(item: viewModel.entry.imageURL, preview: SharePreview("Captura \(viewModel.entry.capturedAt.formatted(date: .abbreviated, time: .shortened))", image: Image(systemName: "photo"))) {
+                    Button {
+                        if let shareURL = viewModel.renderedImageForSharing() {
+                            shareItem = shareURL
+                        }
+                    } label: {
                         Label("Compartir", systemImage: "square.and.arrow.up")
                     }
                 }
@@ -247,6 +274,9 @@ struct OffsiteCaptureDetailView: View {
                                 .padding(.vertical, 5)
                                 .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 8))
                         }
+
+                        // Capas 3D toggleables en modo vista
+                        layersToggle
                     } else if let metadata = viewModel.data?.lidarMetadata {
                         VStack(alignment: .leading, spacing: 4) {
                             HStack(spacing: 6) {
@@ -320,14 +350,22 @@ struct OffsiteCaptureDetailView: View {
         }
         .sheet(isPresented: $showFloorPlan) {
             if let snapshot = viewModel.data?.sceneSnapshot {
-                FloorPlanView(floorPlanData: FloorPlanGenerator.generate(from: snapshot.planes))
+                FloorPlanView(floorPlanData: FloorPlanGenerator.generate(from: snapshot.planes, corners: snapshot.corners))
+            }
+        }
+        .sheet(isPresented: Binding(
+            get: { shareItem != nil },
+            set: { if !$0 { shareItem = nil } }
+        )) {
+            if let url = shareItem {
+                ShareSheet(activityItems: [url])
             }
         }
         .onChange(of: selectedImage) { _, newImage in
-            if let image = newImage, let frameId = viewModel.selectedFrameId {
+            if let image = newImage, let frameId = frameIdForPhotoPicker {
                 viewModel.updateFrameImage(id: frameId, image: image)
                 selectedImage = nil
-                showImagePicker = false
+                frameIdForPhotoPicker = nil
             }
         }
         .onAppear {
@@ -351,10 +389,11 @@ struct OffsiteCaptureDetailView: View {
         DragGesture(minimumDistance: 0)
             .onChanged { value in
                 guard viewModel.isEditMode else { return }
+                let adjustedCurrent = adjustedLocation(value.location, viewSize: viewSize)
+
                 if viewModel.editTool == .select {
                     let dist = sqrt(value.translation.width * value.translation.width + value.translation.height * value.translation.height)
                     let adjustedStart = adjustedLocation(value.startLocation, viewSize: viewSize)
-                    let adjustedCurrent = adjustedLocation(value.location, viewSize: viewSize)
                     if !viewModel.isDragging && dist > AppConstants.OffsiteEditor.minDragDistance && viewModel.selectedItem != nil {
                         viewModel.handleDragStart(at: adjustedStart, viewSize: viewSize, imageSize: imageSize)
                     }
@@ -362,9 +401,30 @@ struct OffsiteCaptureDetailView: View {
                         viewModel.handleDragChanged(to: adjustedCurrent, viewSize: viewSize, imageSize: imageSize)
                     }
                 }
+
+                // Preview de medición en tiempo real
+                if viewModel.editTool == .measure && viewModel.pendingMeasurementNormalizedPoint != nil {
+                    currentFingerPosition = adjustedCurrent
+                }
+
+                // Magnifier: trackear toque activo para todos los tools
+                let scale = viewModel.scaleToFit(imageSize: imageSize, in: viewSize)
+                let offset = viewModel.offsetToCenter(imageSize: imageSize, in: viewSize, scale: scale)
+                let normX = (adjustedCurrent.x - offset.x) / (imageSize.width * scale)
+                let normY = (adjustedCurrent.y - offset.y) / (imageSize.height * scale)
+                if (0...1).contains(normX) && (0...1).contains(normY) {
+                    activeTouchPosition = value.location // posición en coordenadas de pantalla
+                    activeTouchNormalized = CGPoint(x: normX, y: normY)
+                } else {
+                    activeTouchPosition = nil
+                    activeTouchNormalized = nil
+                }
             }
             .onEnded { value in
                 guard viewModel.isEditMode else { return }
+                currentFingerPosition = nil
+                activeTouchPosition = nil
+                activeTouchNormalized = nil
                 let adjusted = adjustedLocation(value.location, viewSize: viewSize)
                 if viewModel.editTool == .select {
                     if viewModel.isDragging {
@@ -430,6 +490,7 @@ struct OffsiteCaptureDetailView: View {
 
             if viewModel.selectedItemIsFrame {
                 Button {
+                    frameIdForPhotoPicker = viewModel.selectedFrameId
                     showImagePicker = true
                 } label: {
                     Label("Foto", systemImage: "photo")
@@ -439,6 +500,20 @@ struct OffsiteCaptureDetailView: View {
                         .padding(.horizontal, 12)
                         .padding(.vertical, 8)
                         .background(Color.blue, in: Capsule())
+                }
+            }
+
+            if viewModel.selectedItemIsMeasurement {
+                Button {
+                    viewModel.duplicateSelectedMeasurement()
+                } label: {
+                    Label("Duplicar", systemImage: "doc.on.doc")
+                        .font(.subheadline)
+                        .fontWeight(.medium)
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 8)
+                        .background(Color.orange, in: Capsule())
                 }
             }
 
@@ -560,23 +635,26 @@ struct OffsiteCaptureDetailView: View {
     
     // MARK: - Edit Toolbar
 
+    private var layersToggle: some View {
+        DisclosureGroup("Capas 3D") {
+            HStack(spacing: 12) {
+                OverlayToggle(icon: "rectangle.dashed", label: "Planos", isOn: $showPlaneOverlays, color: .blue)
+                OverlayToggle(icon: "angle", label: "Esquinas", isOn: $showCornerMarkers, color: .yellow)
+                OverlayToggle(icon: "ruler", label: "Cotas", isOn: $showWallDimensions, color: .orange)
+                OverlayToggle(icon: "cube", label: "Cuadros 3D", isOn: $showPerspectiveFrames, color: .purple)
+            }
+            .padding(.top, 4)
+        }
+        .font(.caption)
+        .foregroundStyle(.white)
+        .padding(.horizontal, 16)
+        .padding(.vertical, 8)
+        .background(Color.black.opacity(0.5), in: RoundedRectangle(cornerRadius: 12))
+    }
+
     private var editToolbar: some View {
         VStack(spacing: 12) {
-            // Capas 3D en DisclosureGroup
-            DisclosureGroup("Capas 3D") {
-                HStack(spacing: 12) {
-                    OverlayToggle(icon: "rectangle.dashed", label: "Planos", isOn: $showPlaneOverlays, color: .blue)
-                    OverlayToggle(icon: "angle", label: "Esquinas", isOn: $showCornerMarkers, color: .yellow)
-                    OverlayToggle(icon: "ruler", label: "Cotas", isOn: $showWallDimensions, color: .orange)
-                    OverlayToggle(icon: "cube", label: "Cuadros 3D", isOn: $showPerspectiveFrames, color: .purple)
-                }
-                .padding(.top, 4)
-            }
-            .font(.caption)
-            .foregroundStyle(.white)
-            .padding(.horizontal, 16)
-            .padding(.vertical, 8)
-            .background(Color.black.opacity(0.5), in: RoundedRectangle(cornerRadius: 12))
+            layersToggle
 
             HStack(spacing: 12) {
                 // Undo/Redo
@@ -645,9 +723,10 @@ struct OffsiteCaptureDetailView: View {
     // MARK: - Overlays
 
     @ViewBuilder
-    private func overlaysView(data: OffsiteCaptureData, viewSize: CGSize, imageSize: CGSize) -> some View {
+    private func overlaysView(data: OffsiteCaptureData, viewSize: CGSize, imageSize: CGSize, zoomScale: CGFloat = 1.0) -> some View {
         let scale = viewModel.scaleToFit(imageSize: imageSize, in: viewSize)
         let offset = viewModel.offsetToCenter(imageSize: imageSize, in: viewSize, scale: scale)
+        let overlayScale = 1.0 / sqrt(zoomScale)
 
         // === Plane overlays ===
         if showPlaneOverlays, let snapshot = data.sceneSnapshot {
@@ -659,6 +738,7 @@ struct OffsiteCaptureDetailView: View {
                     scale: scale,
                     offset: offset,
                     showDimensions: true,
+                    overlayScale: overlayScale,
                     onTap: {
                         selectedPlaneId = selectedPlaneId == plane.id ? nil : plane.id
                         HapticService.shared.impact(style: .light)
@@ -676,7 +756,8 @@ struct OffsiteCaptureDetailView: View {
                     imageSize: imageSize,
                     scale: scale,
                     offset: offset,
-                    unit: viewModel.unit
+                    unit: viewModel.unit,
+                    overlayScale: overlayScale
                 )
                 .opacity(overlayOpacity)
             }
@@ -689,7 +770,8 @@ struct OffsiteCaptureDetailView: View {
                     corner: corner,
                     imageSize: imageSize,
                     scale: scale,
-                    offset: offset
+                    offset: offset,
+                    overlayScale: overlayScale
                 )
                 .opacity(overlayOpacity)
             }
@@ -707,6 +789,7 @@ struct OffsiteCaptureDetailView: View {
                     isSelected: isSelected,
                     isEditMode: viewModel.isEditMode,
                     loadedImage: viewModel.loadFrameImage(filename: frame.imageFilename, base64: frame.imageBase64),
+                    overlayScale: overlayScale,
                     onDelete: {
                         viewModel.deletePerspectiveFrame(id: frame.id)
                     }
@@ -727,6 +810,7 @@ struct OffsiteCaptureDetailView: View {
                 unit: viewModel.unit,
                 isEditMode: viewModel.isEditMode,
                 isSelected: isSelected,
+                overlayScale: overlayScale,
                 onDelete: { viewModel.deleteMeasurement(id: m.id) }
             )
         }
@@ -736,16 +820,16 @@ struct OffsiteCaptureDetailView: View {
             let isSelected = viewModel.selectedItem?.itemId == frame.id && (
                 viewModel.selectedItem == .frame(frame.id) || viewModel.selectedItem == .frameResizeBottomRight(frame.id)
             )
-            frameOverlay(frame, scale: scale, offset: offset, imageSize: imageSize, isSelected: isSelected)
+            frameOverlay(frame, scale: scale, offset: offset, imageSize: imageSize, isSelected: isSelected, overlayScale: overlayScale)
         }
 
         // === Text annotations ===
         ForEach(data.textAnnotations) { annotation in
             let isSelected = viewModel.selectedItem == .textAnnotation(annotation.id)
-            textAnnotationOverlay(annotation, scale: scale, offset: offset, imageSize: imageSize, isSelected: isSelected)
+            textAnnotationOverlay(annotation, scale: scale, offset: offset, imageSize: imageSize, isSelected: isSelected, overlayScale: overlayScale)
         }
 
-        // === Pending measurement point ===
+        // === Pending measurement point + live preview ===
         if let normPoint = viewModel.pendingMeasurementNormalizedPoint {
             let screenPoint = CGPoint(
                 x: normPoint.x * imageSize.width * scale + offset.x,
@@ -762,6 +846,56 @@ struct OffsiteCaptureDetailView: View {
             }
             .position(screenPoint)
             .transition(.scale.combined(with: .opacity))
+
+            // Línea de preview en tiempo real hacia el dedo
+            if let fingerPos = currentFingerPosition {
+                let fingerNormX = (fingerPos.x - offset.x) / (imageSize.width * scale)
+                let fingerNormY = (fingerPos.y - offset.y) / (imageSize.height * scale)
+                let fingerNorm = NormalizedPoint(x: fingerNormX, y: fingerNormY)
+
+                // Línea discontinua naranja semitransparente
+                Path { path in
+                    path.move(to: screenPoint)
+                    path.addLine(to: fingerPos)
+                }
+                .stroke(Color.orange.opacity(0.6), style: StrokeStyle(lineWidth: 2, dash: [8, 6]))
+
+                // Crosshair en la posición del dedo
+                ZStack {
+                    Circle()
+                        .stroke(Color.orange, lineWidth: 2)
+                        .frame(width: 24, height: 24)
+                    Path { path in
+                        path.move(to: CGPoint(x: -8, y: 0))
+                        path.addLine(to: CGPoint(x: 8, y: 0))
+                        path.move(to: CGPoint(x: 0, y: -8))
+                        path.addLine(to: CGPoint(x: 0, y: 8))
+                    }
+                    .stroke(Color.orange, lineWidth: 1.5)
+                }
+                .position(fingerPos)
+
+                // Label con distancia estimada en el midpoint
+                if let dist = viewModel.estimateDistance(
+                    pointA: normPoint,
+                    pointB: fingerNorm,
+                    imageSize: imageSize,
+                    viewSize: viewSize
+                ) {
+                    let mid = CGPoint(
+                        x: (screenPoint.x + fingerPos.x) / 2,
+                        y: (screenPoint.y + fingerPos.y) / 2 - 22
+                    )
+                    Text(viewModel.unit.format(distanceMeters: Float(dist)))
+                        .font(.caption)
+                        .fontWeight(.bold)
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                        .background(Color.orange.opacity(0.8), in: RoundedRectangle(cornerRadius: 6))
+                        .position(mid)
+                }
+            }
         }
     }
 
@@ -770,12 +904,12 @@ struct OffsiteCaptureDetailView: View {
     }
     
     @ViewBuilder
-    private func frameOverlay(_ frame: OffsiteFrame, scale: CGFloat, offset: CGPoint, imageSize: CGSize, isSelected: Bool) -> some View {
+    private func frameOverlay(_ frame: OffsiteFrame, scale: CGFloat, offset: CGPoint, imageSize: CGSize, isSelected: Bool, overlayScale: CGFloat = 1.0) -> some View {
         let x = frame.topLeft.x * imageSize.width * scale + offset.x
         let y = frame.topLeft.y * imageSize.height * scale + offset.y
         let w = frame.width * imageSize.width * scale
         let h = frame.height * imageSize.height * scale
-        let borderWidth = isSelected ? AppConstants.OffsiteEditor.selectionBorderWidth : 3.0
+        let borderWidth = (isSelected ? AppConstants.OffsiteEditor.selectionBorderWidth : 3.0) * overlayScale
 
         ZStack {
             if let frameImage = viewModel.loadFrameImage(filename: frame.imageFilename, base64: frame.imageBase64) {
@@ -801,47 +935,47 @@ struct OffsiteCaptureDetailView: View {
                 VStack(spacing: 2) {
                     if let label = frame.label {
                         Text(label)
-                            .font(.caption)
+                            .font(.system(size: 12 * overlayScale))
                             .fontWeight(.semibold)
                     }
                     Text(String(format: "%.2f x %.2f m", widthM, heightM))
-                        .font(.caption2)
+                        .font(.system(size: 10 * overlayScale))
                 }
                 .foregroundStyle(.white)
-                .padding(.horizontal, 6)
-                .padding(.vertical, 3)
+                .padding(.horizontal, 6 * overlayScale)
+                .padding(.vertical, 3 * overlayScale)
                 .background(Color(hex: frame.color).opacity(0.9), in: RoundedRectangle(cornerRadius: 4))
-                .position(x: x + w/2, y: y - 12)
+                .position(x: x + w/2, y: y - 12 * overlayScale)
             } else if let label = frame.label {
                 Text(label)
-                    .font(.caption)
+                    .font(.system(size: 12 * overlayScale))
                     .fontWeight(.semibold)
                     .foregroundStyle(.white)
-                    .padding(.horizontal, 6)
-                    .padding(.vertical, 2)
+                    .padding(.horizontal, 6 * overlayScale)
+                    .padding(.vertical, 2 * overlayScale)
                     .background(Color(hex: frame.color), in: RoundedRectangle(cornerRadius: 4))
-                    .position(x: x + w/2, y: y - 8)
+                    .position(x: x + w/2, y: y - 8 * overlayScale)
             }
 
             // Selection highlight
             if isSelected {
                 Rectangle()
-                    .strokeBorder(Color.yellow, lineWidth: AppConstants.OffsiteEditor.selectionBorderWidth)
+                    .strokeBorder(Color.yellow, lineWidth: AppConstants.OffsiteEditor.selectionBorderWidth * overlayScale)
                     .frame(width: w + 8, height: h + 8)
                     .position(x: x + w/2, y: y + h/2)
 
-                DragHandleView()
+                DragHandleView(overlayScale: overlayScale)
                     .position(x: x + w/2, y: y + h/2)
 
                 // Resize handle en esquina inferior derecha
-                ResizeHandleView()
+                ResizeHandleView(overlayScale: overlayScale)
                     .position(x: x + w, y: y + h)
             }
         }
     }
 
     @ViewBuilder
-    private func textAnnotationOverlay(_ annotation: OffsiteTextAnnotation, scale: CGFloat, offset: CGPoint, imageSize: CGSize, isSelected: Bool) -> some View {
+    private func textAnnotationOverlay(_ annotation: OffsiteTextAnnotation, scale: CGFloat, offset: CGPoint, imageSize: CGSize, isSelected: Bool, overlayScale: CGFloat = 1.0) -> some View {
         let pos = CGPoint(
             x: annotation.position.x * imageSize.width * scale + offset.x,
             y: annotation.position.y * imageSize.height * scale + offset.y
@@ -849,11 +983,11 @@ struct OffsiteCaptureDetailView: View {
 
         ZStack {
             Text(annotation.text)
-                .font(.subheadline)
+                .font(.system(size: 15 * overlayScale))
                 .fontWeight(.medium)
                 .foregroundStyle(Color(hex: annotation.color))
-                .padding(.horizontal, 8)
-                .padding(.vertical, 4)
+                .padding(.horizontal, 8 * overlayScale)
+                .padding(.vertical, 4 * overlayScale)
                 .background(
                     isSelected ? Color.yellow.opacity(0.3) : Color.black.opacity(0.7),
                     in: RoundedRectangle(cornerRadius: 6)
@@ -946,4 +1080,5 @@ struct ImagePicker: UIViewControllerRepresentable {
     }
 }
 
+// ShareSheet → definido en MedidasSectionView.swift
 // Color(hex:) → Extraído a Extensions/Color+Hex.swift

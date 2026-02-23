@@ -9,6 +9,7 @@
 import SwiftUI
 import Observation
 import os.log
+import simd
 
 // MARK: - List ViewModel
 
@@ -111,6 +112,10 @@ final class OffsiteCaptureDetailViewModel {
     private let hapticService: HapticServiceProtocol
     private let logger = Logger(subsystem: Bundle.main.bundleIdentifier ?? "lidar", category: "OffsiteDetailVM")
 
+    // MARK: - Depth Map Cache
+    private var cachedDepthMapData: Data?
+    private var isDepthMapLoaded = false
+
     enum EditTool: Equatable {
         case none, select, measure, frame, text, placeFrame
     }
@@ -130,6 +135,25 @@ final class OffsiteCaptureDetailViewModel {
     func loadContent() {
         image = UIImage(contentsOfFile: entry.imageURL.path)
         data = storageService.loadCaptureData(from: entry.jsonURL)
+
+        // Sync: si top-level vacío pero snapshot tiene datos, copiar del snapshot
+        if var d = data, let snapshot = d.sceneSnapshot {
+            var changed = false
+            if d.measurements.isEmpty && !snapshot.measurements.isEmpty {
+                d.measurements = snapshot.measurements
+                changed = true
+            }
+            if d.frames.isEmpty && !snapshot.frames.isEmpty {
+                d.frames = snapshot.frames
+                changed = true
+            }
+            if d.textAnnotations.isEmpty && !snapshot.textAnnotations.isEmpty {
+                d.textAnnotations = snapshot.textAnnotations
+                changed = true
+            }
+            if changed { data = d }
+        }
+
         logger.info("Contenido cargado para: \(self.entry.id)")
     }
 
@@ -266,7 +290,7 @@ final class OffsiteCaptureDetailViewModel {
         let endpointRadius = AppConstants.OffsiteEditor.endpointHitTestRadius
         let hitRadius = AppConstants.OffsiteEditor.hitTestRadius
 
-        // Prioridad 1: Endpoints de medición
+        // Prioridad 1: Endpoints de medición + handle de rotación
         for m in currentData.measurements {
             let pA = CGPoint(
                 x: m.pointA.x * imageSize.width * scale + offset.x,
@@ -281,6 +305,20 @@ final class OffsiteCaptureDetailViewModel {
             )
             if distance(location, pB) <= endpointRadius {
                 return .measurementEndpointB(m.id)
+            }
+            // Handle de rotación: perpendicular al midpoint (solo si seleccionada)
+            if let sel = selectedItem, sel.itemId == m.id {
+                let mid = CGPoint(x: (pA.x + pB.x) / 2, y: (pA.y + pB.y) / 2)
+                let dx = pB.x - pA.x
+                let dy = pB.y - pA.y
+                let len = hypot(dx, dy)
+                guard len > 1 else { continue }
+                let perpX = -dy / len * 30  // 30pt perpendicular
+                let perpY = dx / len * 30
+                let rotateHandle = CGPoint(x: mid.x + perpX, y: mid.y + perpY)
+                if distance(location, rotateHandle) <= endpointRadius {
+                    return .measurementRotate(m.id)
+                }
             }
         }
 
@@ -362,11 +400,17 @@ final class OffsiteCaptureDetailViewModel {
         isDragging = true
         pushUndoState()
 
-        // Verificar que el drag es sobre el item seleccionado (mismo UUID)
+        // Verificar proximidad al item seleccionado (relajado para mejor UX)
         let hitItem = hitTest(at: location, viewSize: viewSize, imageSize: imageSize)
         if hitItem?.itemId != item.itemId {
-            isDragging = false
-            dragStartNormalized = nil
+            // Si no coincide con hit test estricto, verificar distancia razonable al item
+            let itemCenter = centerOfItem(item, imageSize: imageSize, scale: scale, offset: offset)
+            if let center = itemCenter, distance(location, center) < AppConstants.OffsiteEditor.relaxedDragRadius {
+                // Permitir drag - el item ya estaba seleccionado y estamos cerca
+            } else {
+                isDragging = false
+                dragStartNormalized = nil
+            }
         }
     }
 
@@ -390,9 +434,7 @@ final class OffsiteCaptureDetailViewModel {
             let newX = clamp(m.pointA.x + dx, 0, 1)
             let newY = clamp(m.pointA.y + dy, 0, 1)
             m.pointA = NormalizedPoint(x: newX, y: newY)
-            if !m.isFromAR {
-                m.distanceMeters = recalculateDistance(pointA: m.pointA, pointB: m.pointB, data: currentData, imageSize: imageSize, viewSize: viewSize)
-            }
+            m.distanceMeters = recalculateDistance(pointA: m.pointA, pointB: m.pointB, data: currentData, imageSize: imageSize, viewSize: viewSize)
             currentData.measurements[idx] = m
 
         case .measurementEndpointB(let id):
@@ -401,9 +443,7 @@ final class OffsiteCaptureDetailViewModel {
             let newX = clamp(m.pointB.x + dx, 0, 1)
             let newY = clamp(m.pointB.y + dy, 0, 1)
             m.pointB = NormalizedPoint(x: newX, y: newY)
-            if !m.isFromAR {
-                m.distanceMeters = recalculateDistance(pointA: m.pointA, pointB: m.pointB, data: currentData, imageSize: imageSize, viewSize: viewSize)
-            }
+            m.distanceMeters = recalculateDistance(pointA: m.pointA, pointB: m.pointB, data: currentData, imageSize: imageSize, viewSize: viewSize)
             currentData.measurements[idx] = m
 
         case .measurement(let id):
@@ -415,6 +455,27 @@ final class OffsiteCaptureDetailViewModel {
             let newBy = clamp(m.pointB.y + dy, 0, 1)
             m.pointA = NormalizedPoint(x: newAx, y: newAy)
             m.pointB = NormalizedPoint(x: newBx, y: newBy)
+            // Recalcular distancia al mover (depth-aware si disponible)
+            m.distanceMeters = recalculateDistance(pointA: m.pointA, pointB: m.pointB, data: currentData, imageSize: imageSize, viewSize: viewSize)
+            currentData.measurements[idx] = m
+
+        case .measurementRotate(let id):
+            guard let idx = currentData.measurements.firstIndex(where: { $0.id == id }) else { return }
+            var m = currentData.measurements[idx]
+            // Rotar endpoints alrededor del midpoint
+            let midX = (m.pointA.x + m.pointB.x) / 2
+            let midY = (m.pointA.y + m.pointB.y) / 2
+            let halfDx = m.pointB.x - midX
+            let halfDy = m.pointB.y - midY
+            // Calcular ángulo de rotación desde el desplazamiento del drag
+            let angle = Double(dx) * .pi  // Sensibilidad: mover toda la imagen = 180°
+            let cosA = cos(angle)
+            let sinA = sin(angle)
+            let newHalfDx = halfDx * cosA - halfDy * sinA
+            let newHalfDy = halfDx * sinA + halfDy * cosA
+            m.pointA = NormalizedPoint(x: clamp(midX - newHalfDx, 0, 1), y: clamp(midY - newHalfDy, 0, 1))
+            m.pointB = NormalizedPoint(x: clamp(midX + newHalfDx, 0, 1), y: clamp(midY + newHalfDy, 0, 1))
+            m.distanceMeters = recalculateDistance(pointA: m.pointA, pointB: m.pointB, data: currentData, imageSize: imageSize, viewSize: viewSize)
             currentData.measurements[idx] = m
 
         case .frame(let id):
@@ -438,12 +499,22 @@ final class OffsiteCaptureDetailViewModel {
             guard var snapshot = currentData.sceneSnapshot,
                   let idx = snapshot.perspectiveFrames.firstIndex(where: { $0.id == id }) else { return }
             var pf = snapshot.perspectiveFrames[idx]
-            let newCx = clamp(pf.center2D.x + dx, 0, 1)
-            let newCy = clamp(pf.center2D.y + dy, 0, 1)
-            pf.center2D = NormalizedPoint(x: newCx, y: newCy)
+            // Calcular offset ajustado: si algún corner se sale de [0,1], reducir el offset
+            var adjDx = dx
+            var adjDy = dy
+            for corner in pf.corners2D {
+                guard corner.count >= 2 else { continue }
+                let newX = corner[0] + adjDx
+                let newY = corner[1] + adjDy
+                if newX < 0 { adjDx -= newX }
+                if newX > 1 { adjDx -= (newX - 1) }
+                if newY < 0 { adjDy -= newY }
+                if newY > 1 { adjDy -= (newY - 1) }
+            }
+            pf.center2D = NormalizedPoint(x: pf.center2D.x + adjDx, y: pf.center2D.y + adjDy)
             pf.corners2D = pf.corners2D.map { corner in
                 guard corner.count >= 2 else { return corner }
-                return [clamp(corner[0] + dx, 0, 1), clamp(corner[1] + dy, 0, 1)]
+                return [corner[0] + adjDx, corner[1] + adjDy]
             }
             snapshot.perspectiveFrames[idx] = pf
             currentData.sceneSnapshot = snapshot
@@ -473,7 +544,7 @@ final class OffsiteCaptureDetailViewModel {
         guard let item = selectedItem else { return }
 
         switch item {
-        case .measurement(let id), .measurementEndpointA(let id), .measurementEndpointB(let id):
+        case .measurement(let id), .measurementEndpointA(let id), .measurementEndpointB(let id), .measurementRotate(let id):
             deleteMeasurement(id: id)
         case .frame(let id), .frameResizeBottomRight(let id):
             deleteFrame(id: id)
@@ -484,6 +555,30 @@ final class OffsiteCaptureDetailViewModel {
         }
 
         selectedItem = nil
+    }
+
+    /// Duplica la medición seleccionada con un pequeño offset.
+    func duplicateSelectedMeasurement() {
+        guard let item = selectedItem, var currentData = data else { return }
+        let id: UUID
+        switch item {
+        case .measurement(let i), .measurementEndpointA(let i), .measurementEndpointB(let i), .measurementRotate(let i):
+            id = i
+        default: return
+        }
+        guard let m = currentData.measurements.first(where: { $0.id == id }) else { return }
+        pushUndoState()
+        let offset = 0.03  // Pequeño desplazamiento visual
+        let copy = OffsiteMeasurement(
+            distanceMeters: m.distanceMeters,
+            pointA: NormalizedPoint(x: clamp(m.pointA.x + offset, 0, 1), y: clamp(m.pointA.y + offset, 0, 1)),
+            pointB: NormalizedPoint(x: clamp(m.pointB.x + offset, 0, 1), y: clamp(m.pointB.y + offset, 0, 1)),
+            isFromAR: false  // La copia es offsite, ya no es AR
+        )
+        currentData.measurements.append(copy)
+        data = currentData
+        selectedItem = .measurement(copy.id)
+        hapticService.impact(style: .medium)
     }
 
     func deletePerspectiveFrame(id: UUID) {
@@ -594,6 +689,219 @@ final class OffsiteCaptureDetailViewModel {
         }
     }
 
+    // MARK: - Image Rendering
+
+    /// Renderiza la imagen original con todos los overlays (mediciones, cuadros, texto) usando Core Graphics.
+    func renderImageWithOverlays() -> UIImage? {
+        guard let baseImage = image, let currentData = data else { return nil }
+        let imgSize = baseImage.size
+
+        let renderer = UIGraphicsImageRenderer(size: imgSize)
+        return renderer.image { ctx in
+            let cgCtx = ctx.cgContext
+
+            // 1. Dibujar imagen base
+            baseImage.draw(at: .zero)
+
+            // 2. Dibujar mediciones
+            for m in currentData.measurements {
+                let pA = CGPoint(x: m.pointA.x * imgSize.width, y: m.pointA.y * imgSize.height)
+                let pB = CGPoint(x: m.pointB.x * imgSize.width, y: m.pointB.y * imgSize.height)
+                let color = m.isFromAR ? UIColor.cyan : UIColor.orange
+
+                // Línea
+                cgCtx.setStrokeColor(color.cgColor)
+                cgCtx.setLineWidth(3.0)
+                cgCtx.move(to: pA)
+                cgCtx.addLine(to: pB)
+                cgCtx.strokePath()
+
+                // Endpoints
+                let endpointRadius: CGFloat = 8
+                for p in [pA, pB] {
+                    cgCtx.setFillColor(color.cgColor)
+                    cgCtx.fillEllipse(in: CGRect(x: p.x - endpointRadius, y: p.y - endpointRadius, width: endpointRadius * 2, height: endpointRadius * 2))
+                    cgCtx.setStrokeColor(UIColor.white.cgColor)
+                    cgCtx.setLineWidth(1.5)
+                    cgCtx.strokeEllipse(in: CGRect(x: p.x - endpointRadius, y: p.y - endpointRadius, width: endpointRadius * 2, height: endpointRadius * 2))
+                }
+
+                // Etiqueta de distancia
+                let midPoint = CGPoint(x: (pA.x + pB.x) / 2, y: (pA.y + pB.y) / 2)
+                let label = String(format: "%.2f m", m.distanceMeters)
+                let attrs: [NSAttributedString.Key: Any] = [
+                    .font: UIFont.boldSystemFont(ofSize: 14),
+                    .foregroundColor: UIColor.white
+                ]
+                let labelSize = (label as NSString).size(withAttributes: attrs)
+                let labelRect = CGRect(
+                    x: midPoint.x - labelSize.width / 2 - 4,
+                    y: midPoint.y - labelSize.height / 2 - 2,
+                    width: labelSize.width + 8,
+                    height: labelSize.height + 4
+                )
+                cgCtx.setFillColor(color.withAlphaComponent(0.85).cgColor)
+                let labelPath = UIBezierPath(roundedRect: labelRect, cornerRadius: 4)
+                cgCtx.addPath(labelPath.cgPath)
+                cgCtx.fillPath()
+                (label as NSString).draw(
+                    at: CGPoint(x: labelRect.origin.x + 4, y: labelRect.origin.y + 2),
+                    withAttributes: attrs
+                )
+            }
+
+            // 3. Dibujar cuadros standard
+            for frame in currentData.frames {
+                let x = frame.topLeft.x * imgSize.width
+                let y = frame.topLeft.y * imgSize.height
+                let w = frame.width * imgSize.width
+                let h = frame.height * imgSize.height
+                let frameRect = CGRect(x: x, y: y, width: w, height: h)
+                let frameColor = Self.uiColor(fromHex: frame.color)
+
+                // Imagen del cuadro si tiene
+                if let frameImg = self.loadFrameImage(filename: frame.imageFilename, base64: frame.imageBase64) {
+                    frameImg.draw(in: frameRect)
+                }
+
+                // Borde
+                cgCtx.setStrokeColor(frameColor.cgColor)
+                cgCtx.setLineWidth(3.0)
+                cgCtx.stroke(frameRect)
+
+                // Label
+                if let label = frame.label {
+                    let labelText: String
+                    if let wm = frame.widthMeters, let hm = frame.heightMeters {
+                        labelText = "\(label) (\(String(format: "%.2f×%.2f m", wm, hm)))"
+                    } else {
+                        labelText = label
+                    }
+                    self.drawLabel(labelText, at: CGPoint(x: x + w / 2, y: y - 6), color: frameColor, in: cgCtx)
+                }
+            }
+
+            // 4. Dibujar cuadros perspectiva
+            if let perspectiveFrames = currentData.sceneSnapshot?.perspectiveFrames {
+                for pf in perspectiveFrames {
+                    let corners = pf.corners2D.compactMap { pt -> CGPoint? in
+                        guard pt.count >= 2 else { return nil }
+                        return CGPoint(x: pt[0] * imgSize.width, y: pt[1] * imgSize.height)
+                    }
+                    guard corners.count >= 3 else { continue }
+                    let pfColor = Self.uiColor(fromHex: pf.color)
+
+                    // Imagen del cuadro si tiene
+                    if let pfImg = self.loadFrameImage(filename: pf.imageFilename, base64: pf.imageBase64) {
+                        cgCtx.saveGState()
+                        let path = UIBezierPath()
+                        path.move(to: corners[0])
+                        for i in 1..<corners.count { path.addLine(to: corners[i]) }
+                        path.close()
+                        path.addClip()
+                        let boundingBox = path.bounds
+                        pfImg.draw(in: boundingBox)
+                        cgCtx.restoreGState()
+                    }
+
+                    // Polígono borde
+                    cgCtx.setStrokeColor(pfColor.cgColor)
+                    cgCtx.setLineWidth(3.0)
+                    cgCtx.move(to: corners[0])
+                    for i in 1..<corners.count { cgCtx.addLine(to: corners[i]) }
+                    cgCtx.closePath()
+                    cgCtx.strokePath()
+
+                    // Label
+                    if let label = pf.label {
+                        let center = CGPoint(x: pf.center2D.x * imgSize.width, y: pf.center2D.y * imgSize.height)
+                        self.drawLabel(label, at: CGPoint(x: center.x, y: corners.map(\.y).min()! - 6), color: pfColor, in: cgCtx)
+                    }
+                }
+            }
+
+            // 5. Dibujar texto annotations
+            for ann in currentData.textAnnotations {
+                let pos = CGPoint(x: ann.position.x * imgSize.width, y: ann.position.y * imgSize.height)
+                let annColor = Self.uiColor(fromHex: ann.color)
+                let attrs: [NSAttributedString.Key: Any] = [
+                    .font: UIFont.systemFont(ofSize: 16, weight: .medium),
+                    .foregroundColor: annColor
+                ]
+                let textSize = (ann.text as NSString).size(withAttributes: attrs)
+                let bgRect = CGRect(
+                    x: pos.x - textSize.width / 2 - 6,
+                    y: pos.y - textSize.height / 2 - 3,
+                    width: textSize.width + 12,
+                    height: textSize.height + 6
+                )
+                cgCtx.setFillColor(UIColor.black.withAlphaComponent(0.7).cgColor)
+                let bgPath = UIBezierPath(roundedRect: bgRect, cornerRadius: 6)
+                cgCtx.addPath(bgPath.cgPath)
+                cgCtx.fillPath()
+                (ann.text as NSString).draw(
+                    at: CGPoint(x: bgRect.origin.x + 6, y: bgRect.origin.y + 3),
+                    withAttributes: attrs
+                )
+            }
+        }
+    }
+
+    /// Dibuja un label centrado horizontalmente sobre un punto.
+    private func drawLabel(_ text: String, at point: CGPoint, color: UIColor, in cgCtx: CGContext) {
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font: UIFont.boldSystemFont(ofSize: 12),
+            .foregroundColor: UIColor.white
+        ]
+        let size = (text as NSString).size(withAttributes: attrs)
+        let rect = CGRect(
+            x: point.x - size.width / 2 - 4,
+            y: point.y - size.height - 2,
+            width: size.width + 8,
+            height: size.height + 4
+        )
+        cgCtx.setFillColor(color.withAlphaComponent(0.9).cgColor)
+        let path = UIBezierPath(roundedRect: rect, cornerRadius: 4)
+        cgCtx.addPath(path.cgPath)
+        cgCtx.fillPath()
+        (text as NSString).draw(at: CGPoint(x: rect.origin.x + 4, y: rect.origin.y + 2), withAttributes: attrs)
+    }
+
+    /// Convierte un string hex a UIColor para renderizado Core Graphics.
+    private static func uiColor(fromHex hex: String) -> UIColor {
+        let hex = hex.trimmingCharacters(in: CharacterSet.alphanumerics.inverted)
+        var int: UInt64 = 0
+        Scanner(string: hex).scanHexInt64(&int)
+        let r, g, b: CGFloat
+        if hex.count == 6 {
+            r = CGFloat((int >> 16) & 0xFF) / 255
+            g = CGFloat((int >> 8) & 0xFF) / 255
+            b = CGFloat(int & 0xFF) / 255
+        } else {
+            r = 0; g = 0; b = 0
+        }
+        return UIColor(red: r, green: g, blue: b, alpha: 1)
+    }
+
+    // MARK: - Sharing
+
+    /// Renderiza la imagen con overlays a un archivo temporal para compartir.
+    func renderedImageForSharing() -> URL? {
+        guard let rendered = renderImageWithOverlays(),
+              let jpegData = rendered.jpegData(compressionQuality: AppConstants.Capture.jpegQuality) else {
+            return nil
+        }
+        let tempURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("share_\(entry.id).jpg")
+        do {
+            try jpegData.write(to: tempURL)
+            return tempURL
+        } catch {
+            logger.error("Error creando imagen temporal para compartir: \(error.localizedDescription)")
+            return nil
+        }
+    }
+
     // MARK: - Improved Save & Cancel
 
     func saveChanges() {
@@ -611,14 +919,24 @@ final class OffsiteCaptureDetailViewModel {
 
         do {
             try storageService.saveCaptureData(currentData, to: entry.jsonURL)
-            data = currentData
-            originalDataSnapshot = currentData
-            hapticService.notification(type: .success)
-            exitEditMode()
-            logger.info("Cambios guardados")
         } catch {
-            logger.error("Error guardando: \(error.localizedDescription)")
+            logger.error("Error guardando JSON: \(error.localizedDescription)")
+            hapticService.notification(type: .error)
+            return
         }
+
+        // Actualizar thumbnail (no crítico — si falla, el JSON ya está guardado)
+        if let rendered = renderImageWithOverlays() {
+            try? storageService.updateCaptureThumbnail(rendered, for: entry)
+        }
+
+        data = currentData
+        originalDataSnapshot = currentData
+        undoStack.removeAll()
+        redoStack.removeAll()
+        hapticService.notification(type: .success)
+        exitEditMode()
+        logger.info("Cambios guardados")
     }
 
     func cancelEdit() {
@@ -634,7 +952,7 @@ final class OffsiteCaptureDetailViewModel {
     var selectedItemName: String? {
         guard let item = selectedItem, let currentData = data else { return nil }
         switch item {
-        case .measurement(let id), .measurementEndpointA(let id), .measurementEndpointB(let id):
+        case .measurement(let id), .measurementEndpointA(let id), .measurementEndpointB(let id), .measurementRotate(let id):
             return currentData.measurements.first(where: { $0.id == id }).map { m in
                 "Medición (\(String(format: "%.2f m", m.distanceMeters)))"
             }
@@ -651,7 +969,7 @@ final class OffsiteCaptureDetailViewModel {
     var selectedItemIcon: String {
         guard let item = selectedItem else { return "" }
         switch item {
-        case .measurement, .measurementEndpointA, .measurementEndpointB: return "ruler"
+        case .measurement, .measurementEndpointA, .measurementEndpointB, .measurementRotate: return "ruler"
         case .frame, .frameResizeBottomRight: return "rectangle.dashed"
         case .perspectiveFrame: return "cube"
         case .textAnnotation: return "text.bubble"
@@ -667,6 +985,14 @@ final class OffsiteCaptureDetailViewModel {
         }
     }
 
+    var selectedItemIsMeasurement: Bool {
+        guard let item = selectedItem else { return false }
+        switch item {
+        case .measurement, .measurementEndpointA, .measurementEndpointB, .measurementRotate: return true
+        default: return false
+        }
+    }
+
     /// ID del cuadro seleccionado (standard o perspectiva).
     var selectedFrameId: UUID? {
         guard let item = selectedItem else { return nil }
@@ -677,6 +1003,33 @@ final class OffsiteCaptureDetailViewModel {
     }
 
     // MARK: - Geometry Helpers
+
+    /// Devuelve el centro en coordenadas de pantalla del item seleccionado.
+    private func centerOfItem(_ item: SelectableItemType, imageSize: CGSize, scale: CGFloat, offset: CGPoint) -> CGPoint? {
+        guard let currentData = data else { return nil }
+        switch item {
+        case .measurement(let id), .measurementEndpointA(let id), .measurementEndpointB(let id), .measurementRotate(let id):
+            guard let m = currentData.measurements.first(where: { $0.id == id }) else { return nil }
+            let cx = ((m.pointA.x + m.pointB.x) / 2) * imageSize.width * scale + offset.x
+            let cy = ((m.pointA.y + m.pointB.y) / 2) * imageSize.height * scale + offset.y
+            return CGPoint(x: cx, y: cy)
+        case .frame(let id), .frameResizeBottomRight(let id):
+            guard let f = currentData.frames.first(where: { $0.id == id }) else { return nil }
+            let cx = (f.topLeft.x + f.width / 2) * imageSize.width * scale + offset.x
+            let cy = (f.topLeft.y + f.height / 2) * imageSize.height * scale + offset.y
+            return CGPoint(x: cx, y: cy)
+        case .perspectiveFrame(let id):
+            guard let pf = currentData.sceneSnapshot?.perspectiveFrames.first(where: { $0.id == id }) else { return nil }
+            let cx = pf.center2D.x * imageSize.width * scale + offset.x
+            let cy = pf.center2D.y * imageSize.height * scale + offset.y
+            return CGPoint(x: cx, y: cy)
+        case .textAnnotation(let id):
+            guard let ann = currentData.textAnnotations.first(where: { $0.id == id }) else { return nil }
+            let cx = ann.position.x * imageSize.width * scale + offset.x
+            let cy = ann.position.y * imageSize.height * scale + offset.y
+            return CGPoint(x: cx, y: cy)
+        }
+    }
 
     func scaleToFit(imageSize: CGSize, in viewSize: CGSize) -> CGFloat {
         guard imageSize.width > 0, imageSize.height > 0 else { return 1 }
@@ -890,10 +1243,141 @@ final class OffsiteCaptureDetailViewModel {
         max(lo, min(hi, value))
     }
 
+    // MARK: - Depth Map
+
+    /// Carga el depth map desde disco si existe y no ha sido cargado aún.
+    private func loadDepthMapIfNeeded() -> Data? {
+        if isDepthMapLoaded { return cachedDepthMapData }
+        isDepthMapLoaded = true
+        guard let snapshot = data?.sceneSnapshot,
+              let filename = snapshot.depthMapFilename,
+              !filename.isEmpty else { return nil }
+        cachedDepthMapData = storageService.loadDepthMap(captureId: entry.id, filename: filename)
+        return cachedDepthMapData
+    }
+
+    /// Muestrea la profundidad en un punto normalizado (0-1) con interpolación bilineal.
+    private func sampleDepth(at point: NormalizedPoint, depthData: Data, width: Int, height: Int) -> Float? {
+        let expectedSize = width * height * MemoryLayout<Float>.size
+        guard depthData.count >= expectedSize, width > 0, height > 0 else { return nil }
+
+        // El depth map de ARKit está en landscape-left nativo.
+        // Las coordenadas normalizadas están en portrait (orientación de la app).
+        // Transformar: portrait (x,y) → landscape-left (lx, ly)
+        // En landscape-left: lx = y_portrait, ly = 1 - x_portrait
+        let lx = point.y
+        let ly = 1.0 - point.x
+
+        let fx = lx * Double(width - 1)
+        let fy = ly * Double(height - 1)
+        let x0 = Int(fx)
+        let y0 = Int(fy)
+        let x1 = min(x0 + 1, width - 1)
+        let y1 = min(y0 + 1, height - 1)
+        let dx = Float(fx - Double(x0))
+        let dy = Float(fy - Double(y0))
+
+        func valueAt(_ x: Int, _ y: Int) -> Float? {
+            let offset = (y * width + x) * MemoryLayout<Float>.size
+            guard offset + MemoryLayout<Float>.size <= depthData.count else { return nil }
+            let value = depthData.withUnsafeBytes { ptr -> Float in
+                ptr.load(fromByteOffset: offset, as: Float.self)
+            }
+            guard value.isFinite, value > 0 else { return nil }
+            return value
+        }
+
+        guard let v00 = valueAt(x0, y0),
+              let v10 = valueAt(x1, y0),
+              let v01 = valueAt(x0, y1),
+              let v11 = valueAt(x1, y1) else {
+            // Fallback: sin interpolación, usar el más cercano válido
+            return valueAt(x0, y0) ?? valueAt(x1, y0) ?? valueAt(x0, y1) ?? valueAt(x1, y1)
+        }
+
+        let top = v00 * (1 - dx) + v10 * dx
+        let bottom = v01 * (1 - dx) + v11 * dx
+        return top * (1 - dy) + bottom * dy
+    }
+
+    /// Calcula distancia 3D usando depth map y camera intrinsics (unproyección).
+    /// Los intrínsecos de ARKit son para la resolución nativa de la cámara, pero las coordenadas
+    /// normalizadas corresponden a la resolución de la vista capturada (imageWidth x imageHeight).
+    /// Se escalan los intrínsecos proporcionalmente.
+    private func calculateDepthAwareDistance(pointA: NormalizedPoint, pointB: NormalizedPoint, snapshot: OffsiteSceneSnapshot) -> Double? {
+        guard let depthData = loadDepthMapIfNeeded(),
+              let dmW = snapshot.depthMapWidth, dmW > 0,
+              let dmH = snapshot.depthMapHeight, dmH > 0,
+              let cam = snapshot.camera else { return nil }
+
+        guard let depthA = sampleDepth(at: pointA, depthData: depthData, width: dmW, height: dmH),
+              let depthB = sampleDepth(at: pointB, depthData: depthData, width: dmW, height: dmH) else { return nil }
+
+        // Intrínsecos nativos de la cámara ARKit
+        let intrinsics = cam.intrinsicsMatrix
+        let nativeFx = intrinsics.columns.0.x
+        let nativeFy = intrinsics.columns.1.y
+        let nativeCx = intrinsics.columns.2.x
+        let nativeCy = intrinsics.columns.2.y
+
+        // La resolución nativa de la cámara ARKit es el depth map en landscape, rotado a portrait.
+        // El depth map es landscape (ej. 256x192), la cámara nativa es ~1920x1440 landscape.
+        // imageWidth/Height es la resolución de la vista capturada en puntos*scale.
+        // Las coordenadas normalizadas son relativas a imageWidth x imageHeight.
+        // Escalar intrínsecos: factor = imageSize / nativeCameraSize
+        // Pero no tenemos la resolución nativa. Podemos derivarla:
+        // nativeWidth ≈ 2 * nativeCx, nativeHeight ≈ 2 * nativeCy (el centro óptico está ~centrado)
+        let imgW = Float(cam.imageWidth)
+        let imgH = Float(cam.imageHeight)
+        let estimatedNativeW = 2 * nativeCx
+        let estimatedNativeH = 2 * nativeCy
+        guard estimatedNativeW > 0, estimatedNativeH > 0 else { return nil }
+
+        let scaleX = imgW / estimatedNativeW
+        let scaleY = imgH / estimatedNativeH
+        let fx = nativeFx * scaleX
+        let fy = nativeFy * scaleY
+        let cx = nativeCx * scaleX
+        let cy = nativeCy * scaleY
+
+        // Convertir coordenadas normalizadas a pixeles de la imagen capturada
+        let pixA = SIMD2<Float>(Float(pointA.x) * imgW, Float(pointA.y) * imgH)
+        let pixB = SIMD2<Float>(Float(pointB.x) * imgW, Float(pointB.y) * imgH)
+
+        // Unproyectar: x3D = (pixelX - cx) * depth / fx
+        let ptA = SIMD3<Float>(
+            (pixA.x - cx) * depthA / fx,
+            (pixA.y - cy) * depthA / fy,
+            depthA
+        )
+        let ptB = SIMD3<Float>(
+            (pixB.x - cx) * depthB / fx,
+            (pixB.y - cy) * depthB / fy,
+            depthB
+        )
+
+        let diff = ptB - ptA
+        let distance = Double(sqrt(diff.x * diff.x + diff.y * diff.y + diff.z * diff.z))
+        guard distance.isFinite, distance > 0 else { return nil }
+        return distance
+    }
+
+    /// Estima la distancia entre dos puntos (wrapper público para preview en tiempo real).
+    func estimateDistance(pointA: NormalizedPoint, pointB: NormalizedPoint, imageSize: CGSize, viewSize: CGSize) -> Double? {
+        guard let currentData = data else { return nil }
+        return recalculateDistance(pointA: pointA, pointB: pointB, data: currentData, imageSize: imageSize, viewSize: viewSize)
+    }
+
     /// Calcula distancia en metros entre dos puntos normalizados.
     /// Usa las dimensiones reales de la imagen capturada (camera.imageWidth/Height)
     /// para respetar el aspect ratio. Fallback a UIImage.size si no hay datos de cámara.
     private func recalculateDistance(pointA: NormalizedPoint, pointB: NormalizedPoint, data: OffsiteCaptureData, imageSize: CGSize, viewSize: CGSize) -> Double {
+        // Prioridad 1: Depth-aware 3D distance (más precisa, usa profundidad real)
+        if let snapshot = data.sceneSnapshot,
+           let depthDist = calculateDepthAwareDistance(pointA: pointA, pointB: pointB, snapshot: snapshot) {
+            return depthDist
+        }
+
         // Obtener dimensiones consistentes con metersPerPixelScale
         let imgW: Double
         let imgH: Double
@@ -911,12 +1395,12 @@ final class OffsiteCaptureDetailViewModel {
         let pixelDy = (pointB.y - pointA.y) * imgH
         let pixelDistance = sqrt(pixelDx * pixelDx + pixelDy * pixelDy)
 
-        // Prioridad 1: metersPerPixelScale del snapshot (metros/pixel)
+        // Prioridad 2: metersPerPixelScale del snapshot (metros/pixel)
         if let snapshot = data.sceneSnapshot, let mpp = snapshot.metersPerPixelScale, mpp > 0 {
             return pixelDistance * mpp
         }
 
-        // Prioridad 2: Calcular escala desde medición AR
+        // Prioridad 3: Calcular escala desde medición AR
         if let arM = data.measurements.first(where: { $0.isFromAR }) {
             let arPixelDx = (arM.pointB.x - arM.pointA.x) * imgW
             let arPixelDy = (arM.pointB.y - arM.pointA.y) * imgH

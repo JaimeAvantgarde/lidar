@@ -14,7 +14,7 @@ enum FloorPlanGenerator {
     // MARK: - Generación desde sesión AR live
 
     /// Genera un FloorPlanData desde los planos detectados en la sesión AR.
-    static func generate(from planes: [ARPlaneAnchor], classifyPlane: (ARPlaneAnchor) -> PlaneClassification, roomSummary: RoomSummary? = nil) -> FloorPlanData {
+    static func generate(from planes: [ARPlaneAnchor], corners: [(position: SIMD3<Float>, planeA: ARPlaneAnchor, planeB: ARPlaneAnchor, angle: Float)] = [], classifyPlane: (ARPlaneAnchor) -> PlaneClassification, roomSummary: RoomSummary? = nil) -> FloorPlanData {
         // Filtrar solo planos verticales
         let verticalPlanes = planes.filter { $0.alignment == .vertical }
         guard !verticalPlanes.isEmpty else {
@@ -58,7 +58,8 @@ enum FloorPlanGenerator {
                 thickness: AppConstants.FloorPlan.defaultWallThickness,
                 classification: classification,
                 widthMeters: CGFloat(plane.extent.x),
-                heightMeters: CGFloat(plane.extent.z)
+                heightMeters: CGFloat(plane.extent.z),
+                planeId: plane.identifier.uuidString
             )
 
             switch classification {
@@ -70,6 +71,16 @@ enum FloorPlanGenerator {
                 wallSegments.append(segment)
             }
         }
+
+        // Unir segmentos en esquinas detectadas
+        let cornerData = corners.map { c in
+            (position: CGPoint(x: CGFloat(c.position.x), y: CGFloat(c.position.z)),
+             planeIdA: c.planeA.identifier.uuidString,
+             planeIdB: c.planeB.identifier.uuidString)
+        }
+        wallSegments = joinWallsAtCorners(walls: wallSegments, corners: cornerData)
+        doorSegments = joinWallsAtCorners(walls: doorSegments, corners: cornerData)
+        windowSegments = joinWallsAtCorners(walls: windowSegments, corners: cornerData)
 
         let allSegments = wallSegments + doorSegments + windowSegments
         let bounds = computeBounds(segments: allSegments)
@@ -107,7 +118,7 @@ enum FloorPlanGenerator {
     // MARK: - Generación desde datos offsite
 
     /// Genera un FloorPlanData desde datos de planos guardados en una captura offsite.
-    static func generate(from planes: [OffsitePlaneData]) -> FloorPlanData {
+    static func generate(from planes: [OffsitePlaneData], corners: [OffsiteCornerData] = []) -> FloorPlanData {
         // Filtrar solo planos verticales
         let verticalPlanes = planes.filter { $0.isVertical }
         guard !verticalPlanes.isEmpty else {
@@ -150,7 +161,8 @@ enum FloorPlanGenerator {
                 thickness: AppConstants.FloorPlan.defaultWallThickness,
                 classification: plane.classification,
                 widthMeters: CGFloat(plane.extentX),
-                heightMeters: CGFloat(plane.extentZ)
+                heightMeters: CGFloat(plane.extentZ),
+                planeId: plane.id
             )
 
             switch plane.classification {
@@ -162,6 +174,17 @@ enum FloorPlanGenerator {
                 wallSegments.append(segment)
             }
         }
+
+        // Unir segmentos en esquinas
+        let cornerData = corners.map { c in
+            let pos3D = c.position3DSIMD
+            return (position: CGPoint(x: CGFloat(pos3D.x), y: CGFloat(pos3D.z)),
+                    planeIdA: c.planeIdA,
+                    planeIdB: c.planeIdB)
+        }
+        wallSegments = joinWallsAtCorners(walls: wallSegments, corners: cornerData)
+        doorSegments = joinWallsAtCorners(walls: doorSegments, corners: cornerData)
+        windowSegments = joinWallsAtCorners(walls: windowSegments, corners: cornerData)
 
         let allSegments = wallSegments + doorSegments + windowSegments
         let bounds = computeBounds(segments: allSegments)
@@ -182,6 +205,59 @@ enum FloorPlanGenerator {
             bounds: bounds,
             roomSummary: summary
         )
+    }
+
+    // MARK: - Corner Joining
+
+    /// Une segmentos de pared en esquinas detectadas y por proximidad.
+    private static func joinWallsAtCorners(
+        walls: [FloorPlanWallSegment],
+        corners: [(position: CGPoint, planeIdA: String, planeIdB: String)]
+    ) -> [FloorPlanWallSegment] {
+        guard !walls.isEmpty else { return walls }
+        var result = walls
+
+        // Fase 1: Corner snapping — snap endpoints de segmentos matching a la posición de la esquina
+        for corner in corners {
+            for i in 0..<result.count {
+                guard let pid = result[i].planeId else { continue }
+                guard pid == corner.planeIdA || pid == corner.planeIdB else { continue }
+
+                let distStart = hypot(result[i].start.x - corner.position.x, result[i].start.y - corner.position.y)
+                let distEnd = hypot(result[i].end.x - corner.position.x, result[i].end.y - corner.position.y)
+
+                if distStart < distEnd && distStart < 0.5 {
+                    result[i].start = corner.position
+                } else if distEnd < 0.5 {
+                    result[i].end = corner.position
+                }
+            }
+        }
+
+        // Fase 2: Proximity joining — endpoints cercanos sin match de corner
+        let threshold = AppConstants.FloorPlan.proximityJoinThreshold
+        for i in 0..<result.count {
+            for j in (i + 1)..<result.count {
+                let pairs: [(KeyPath<FloorPlanWallSegment, CGPoint>, KeyPath<FloorPlanWallSegment, CGPoint>, Bool, Bool)] = [
+                    (\.end, \.start, false, true),
+                    (\.start, \.end, true, false),
+                    (\.end, \.end, false, false),
+                    (\.start, \.start, true, true),
+                ]
+                for (kpA, kpB, isStartA, isStartB) in pairs {
+                    let pA = result[i][keyPath: kpA]
+                    let pB = result[j][keyPath: kpB]
+                    let dist = hypot(pA.x - pB.x, pA.y - pB.y)
+                    if dist < threshold && dist > 0.001 {
+                        let mid = CGPoint(x: (pA.x + pB.x) / 2, y: (pA.y + pB.y) / 2)
+                        if isStartA { result[i].start = mid } else { result[i].end = mid }
+                        if isStartB { result[j].start = mid } else { result[j].end = mid }
+                    }
+                }
+            }
+        }
+
+        return result
     }
 
     // MARK: - Helpers

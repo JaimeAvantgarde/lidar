@@ -87,6 +87,49 @@ final class ARSceneManager: NSObject {
     /// Nodos del mesh coloreado por profundidad por anchor identifier.
     private var depthMeshNodes: [UUID: SCNNode] = [:]
 
+    /// Estado actual del tracking de la cámara AR.
+    var currentTrackingState: ARCamera.TrackingState = .notAvailable
+
+    /// Calidad estimada de la captura actual.
+    enum CaptureQuality {
+        case poor, fair, good
+
+        var color: String {
+            switch self {
+            case .poor: return "red"
+            case .fair: return "yellow"
+            case .good: return "green"
+            }
+        }
+    }
+
+    /// Nivel de calidad para captura basado en tracking, planos, mediciones y LiDAR.
+    var captureQualityLevel: CaptureQuality {
+        var score = 0
+
+        // Tracking (0-2 pts)
+        switch currentTrackingState {
+        case .normal: score += 2
+        case .limited: score += 1
+        case .notAvailable: score += 0
+        }
+
+        // Planos detectados (0-2 pts)
+        if detectedPlanes.count >= 3 { score += 2 }
+        else if detectedPlanes.count >= 1 { score += 1 }
+
+        // Mediciones (0-2 pts)
+        if measurements.count >= 2 { score += 2 }
+        else if measurements.count >= 1 { score += 1 }
+
+        // LiDAR bonus (1 pt)
+        if isLiDARAvailable { score += 1 }
+
+        if score >= 5 { return .good }
+        if score >= 3 { return .fair }
+        return .poor
+    }
+
     /// Alias: misma lista que detectedPlanes, para uso más explícito.
     var detectedPlaneAnchors: [ARPlaneAnchor] { detectedPlanes }
 
@@ -141,6 +184,7 @@ final class ARSceneManager: NSObject {
     }
     
     func pauseSession() {
+        stopMeasurementPreviewUpdates()
         sceneView?.session.pause()
     }
     
@@ -1038,13 +1082,15 @@ final class ARSceneManager: NSObject {
 
     enum CaptureError: Error, LocalizedError {
         case noSceneView
+        case noFrame
         case invalidBounds
         case imageEncodingFailed
         case saveFailed(Error)
-        
+
         var errorDescription: String? {
             switch self {
             case .noSceneView: return "Vista AR no disponible"
+            case .noFrame: return "No se pudo obtener el frame de la cámara"
             case .invalidBounds: return "Tamaño de vista inválido"
             case .imageEncodingFailed: return "No se pudo codificar la imagen"
             case .saveFailed(let error): return "Error al guardar: \(error.localizedDescription)"
@@ -1052,151 +1098,120 @@ final class ARSceneManager: NSObject {
         }
     }
 
-    /// Captura la vista AR actual con TODOS los datos 3D de la escena.
-    /// Incluye: planos con vértices proyectados, esquinas, mediciones, cuadros con perspectiva,
-    /// datos de cámara, metadata del LiDAR, y dimensiones de todas las paredes.
+    /// Captura la vista AR actual con TODOS los datos 3D de la escena (async).
+    /// Fase 1 (main thread): screenshot + proyecciones. Fase 2 (background): codificación + IO.
     /// - Returns: (URL de la imagen, URL del JSON) o lanza error si falla.
-    func captureForOffsite() throws -> (imageURL: URL, jsonURL: URL) {
+    func captureForOffsite() async throws -> (imageURL: URL, jsonURL: URL) {
         guard let sceneView = sceneView else { throw CaptureError.noSceneView }
-        
-        // Actualizar detección de esquinas antes de capturar
+
+        // === FASE 1: Main thread — captura cámara pura + proyecciones ===
         detectAllCorners()
-        
-        // Capturar con alta resolución (escala 2x en dispositivos retina)
-        let scale = UIScreen.main.scale
-        UIGraphicsBeginImageContextWithOptions(sceneView.bounds.size, false, scale)
-        defer { UIGraphicsEndImageContext() }
-        
-        sceneView.drawHierarchy(in: sceneView.bounds, afterScreenUpdates: true)
-        guard let image = UIGraphicsGetImageFromCurrentImageContext() else {
+
+        // Capturar imagen directamente del feed de cámara (sin overlays de SceneKit)
+        guard let currentFrame = sceneView.session.currentFrame else {
+            throw CaptureError.noFrame
+        }
+        let pixelBuffer = currentFrame.capturedImage
+        let ciImage = CIImage(cvPixelBuffer: pixelBuffer).oriented(.right)
+        let ciContext = CIContext()
+        guard let cgImage = ciContext.createCGImage(ciImage, from: ciImage.extent) else {
             throw CaptureError.imageEncodingFailed
         }
-        
-        let w = sceneView.bounds.width
-        let h = sceneView.bounds.height
-        guard w > 0, h > 0 else { throw CaptureError.invalidBounds }
+        let image = UIImage(cgImage: cgImage)
 
-        // === 1. Proyectar mediciones 3D a coordenadas 2D normalizadas ===
-        let offsiteMeasurements: [OffsiteMeasurement] = measurements.map { m in
-            let pa = sceneView.projectPoint(SCNVector3(m.pointA.x, m.pointA.y, m.pointA.z))
-            let pb = sceneView.projectPoint(SCNVector3(m.pointB.x, m.pointB.y, m.pointB.z))
-            let pointA = NormalizedPoint(x: Double(pa.x) / Double(w), y: Double(pa.y) / Double(h))
-            let pointB = NormalizedPoint(x: Double(pb.x) / Double(w), y: Double(pb.y) / Double(h))
-            return OffsiteMeasurement(id: m.id, distanceMeters: Double(m.distance), pointA: pointA, pointB: pointB, isFromAR: true)
+        // Dimensiones de la imagen capturada (ya en portrait tras .oriented(.right))
+        let imageW = CGFloat(cgImage.width)
+        let imageH = CGFloat(cgImage.height)
+        guard imageW > 0, imageH > 0 else { throw CaptureError.invalidBounds }
+        let camera = currentFrame.camera
+        let imageSize = CGSize(width: imageW, height: imageH)
+
+        // Pre-codificar imagen a JPEG Data (para no pasar UIImage a background)
+        guard let captureImageData = image.jpegData(compressionQuality: AppConstants.Capture.jpegQuality) else {
+            throw CaptureError.imageEncodingFailed
         }
-        
-        // === 2. Proyectar cuadros con perspectiva REAL ===
-        let offsiteFrames: [OffsiteFrame] = placedFrames.compactMap { frame in
-            let frameNode = frame.node
-            let framePosition = frameNode.simdWorldPosition
-            let frameWidthMeters = Double(frame.size.width)
-            let frameHeightMeters = Double(frame.size.height)
-            
-            // Calcular las 4 esquinas del cuadro en 3D usando su orientación real
-            let halfW = Float(frame.size.width) / 2.0
-            let halfH = Float(frame.size.height) / 2.0
-            
-            // Usar la orientación real del nodo para las esquinas
-            let right = frameNode.simdWorldRight
-            let up = frameNode.simdWorldUp
-            
-            let tl3D = framePosition - right * halfW + up * halfH
-            let tr3D = framePosition + right * halfW + up * halfH
-            let br3D = framePosition + right * halfW - up * halfH
-            let bl3D = framePosition - right * halfW - up * halfH
-            
-            let projTL = sceneView.projectPoint(SCNVector3(tl3D))
-            let projTR = sceneView.projectPoint(SCNVector3(tr3D))
-            let projBR = sceneView.projectPoint(SCNVector3(br3D))
-            let projBL = sceneView.projectPoint(SCNVector3(bl3D))
-            
-            let topLeftNorm = NormalizedPoint(x: Double(projTL.x) / Double(w), y: Double(projTL.y) / Double(h))
-            let widthNorm = Double(abs(projTR.x - projTL.x)) / Double(w)
-            let heightNorm = Double(abs(projBL.y - projTL.y)) / Double(h)
-            
-            guard topLeftNorm.x >= -0.2 && topLeftNorm.x <= 1.2 && topLeftNorm.y >= -0.2 && topLeftNorm.y <= 1.2 else {
-                return nil
-            }
-            
-            var imageBase64: String?
-            if let frameImage = frame.image,
-               let jpegData = frameImage.jpegData(compressionQuality: 0.8) {
-                imageBase64 = jpegData.base64EncodedString()
-            }
-            
-            return OffsiteFrame(
-                id: frame.id,
-                topLeft: topLeftNorm,
-                width: widthNorm,
-                height: heightNorm,
-                label: nil,
-                color: "#3B82F6",
-                widthMeters: frameWidthMeters,
-                heightMeters: frameHeightMeters,
-                imageBase64: imageBase64,
-                isCornerFrame: frame.isCornerFrame
+        let thumbnailData = image.preparingThumbnail(of: AppConstants.Capture.thumbnailSize)?
+            .jpegData(compressionQuality: AppConstants.Capture.thumbnailQuality)
+
+        // Helper: proyectar punto 3D a coordenada normalizada clampeada [0,1]
+        // Usa ARCamera.projectPoint para que las coordenadas coincidan con capturedImage
+        func projectNormalized(_ point: SCNVector3) -> NormalizedPoint {
+            let p = camera.projectPoint(
+                simd_float3(point.x, point.y, point.z),
+                orientation: .portrait,
+                viewportSize: imageSize
+            )
+            return NormalizedPoint(
+                x: min(max(Double(p.x) / Double(imageW), 0), 1),
+                y: min(max(Double(p.y) / Double(imageH), 0), 1)
             )
         }
-        
-        // === 3. Cuadros con perspectiva real (4 esquinas proyectadas) ===
-        let perspFrames: [OffsiteFramePerspective] = placedFrames.compactMap { frame in
+
+        // 1. Proyectar mediciones (descartar si ambos puntos fuera de pantalla)
+        let offsiteMeasurements: [OffsiteMeasurement] = measurements.compactMap { m in
+            let pointA = projectNormalized(SCNVector3(m.pointA.x, m.pointA.y, m.pointA.z))
+            let pointB = projectNormalized(SCNVector3(m.pointB.x, m.pointB.y, m.pointB.z))
+            // Descartar si ambos extremos están en el mismo borde (completamente fuera)
+            let aOnEdge = pointA.x <= 0 || pointA.x >= 1 || pointA.y <= 0 || pointA.y >= 1
+            let bOnEdge = pointB.x <= 0 || pointB.x >= 1 || pointB.y <= 0 || pointB.y >= 1
+            if aOnEdge && bOnEdge { return nil }
+            return OffsiteMeasurement(id: m.id, distanceMeters: Double(m.distance), pointA: pointA, pointB: pointB, isFromAR: true)
+        }
+
+        // 2. Cuadros AR solo como perspectiva — extraer JPEG Data en main thread
+        let offsiteFrames: [OffsiteFrame] = []
+
+        struct IntermediateFrame: Sendable {
+            let id: UUID
+            let planeId: String?
+            let center2D: NormalizedPoint
+            let corners2D: [[Double]]
+            let widthMeters: Double
+            let heightMeters: Double
+            let imageJPEGData: Data?
+        }
+
+        let intermediateFrames: [IntermediateFrame] = placedFrames.compactMap { frame in
             let frameNode = frame.node
-            let pos: SIMD3<Float> = frameNode.simdWorldPosition
-            let halfW: Float = Float(frame.size.width) / 2.0
-            let halfH: Float = Float(frame.size.height) / 2.0
-            let right: SIMD3<Float> = frameNode.simdWorldRight
-            let up: SIMD3<Float> = frameNode.simdWorldUp
-            
-            let rW: SIMD3<Float> = right * halfW
-            let uH: SIMD3<Float> = up * halfH
-            let tl: SIMD3<Float> = pos - rW + uH
-            let tr: SIMD3<Float> = pos + rW + uH
-            let br: SIMD3<Float> = pos + rW - uH
-            let bl: SIMD3<Float> = pos - rW - uH
-            let corners3D: [SIMD3<Float>] = [tl, tr, br, bl]
-            
+            let pos = frameNode.simdWorldPosition
+            let halfW = Float(frame.size.width) / 2.0
+            let halfH = Float(frame.size.height) / 2.0
+            let right = frameNode.simdWorldRight
+            let up = frameNode.simdWorldUp
+
+            let rW = right * halfW
+            let uH = up * halfH
+            let corners3D: [SIMD3<Float>] = [pos - rW + uH, pos + rW + uH, pos + rW - uH, pos - rW - uH]
+
             let corners2D = corners3D.map { pt -> [Double] in
-                let p = sceneView.projectPoint(SCNVector3(pt))
-                return [Double(p.x) / Double(w), Double(p.y) / Double(h)]
+                let np = projectNormalized(SCNVector3(pt))
+                return [np.x, np.y]
             }
-            
-            let center = sceneView.projectPoint(SCNVector3(pos))
-            let center2D = NormalizedPoint(x: Double(center.x) / Double(w), y: Double(center.y) / Double(h))
-            
-            var imageBase64: String?
-            if let img = frame.image, let data = img.jpegData(compressionQuality: 0.8) {
-                imageBase64 = data.base64EncodedString()
-            }
-            
-            return OffsiteFramePerspective(
+            let center2D = projectNormalized(SCNVector3(pos))
+            let imageData = frame.image?.jpegData(compressionQuality: 0.8)
+
+            return IntermediateFrame(
                 id: frame.id,
                 planeId: frame.planeAnchor?.identifier.uuidString,
                 center2D: center2D,
                 corners2D: corners2D,
                 widthMeters: Double(frame.size.width),
                 heightMeters: Double(frame.size.height),
-                imageBase64: imageBase64,
-                label: nil,
-                color: "#3B82F6"
+                imageJPEGData: imageData
             )
         }
-        
-        // === 4. Exportar TODOS los planos con vértices 2D proyectados ===
+
+        // 3. Planos con vértices proyectados
         let offsitePlanes: [OffsitePlaneData] = detectedPlanes.map { plane in
             let t = plane.transform
             let center = SIMD3<Float>(t.columns.3.x, t.columns.3.y, t.columns.3.z)
             let normal = planeNormal(plane)
             let classification = classifyPlane(plane)
-            
-            // Obtener vértices 3D del plano (4 esquinas)
             let edges = getPlaneEdgePoints(plane)
-            
-            // Proyectar vértices a 2D
             let projected = edges.map { pt -> [Double] in
-                let p = sceneView.projectPoint(SCNVector3(pt))
-                return [Double(p.x) / Double(w), Double(p.y) / Double(h)]
+                let np = projectNormalized(SCNVector3(pt))
+                return [np.x, np.y]
             }
-            
             return OffsitePlaneData(
                 id: plane.identifier.uuidString,
                 alignment: plane.alignment == .vertical ? "vertical" : "horizontal",
@@ -1211,11 +1226,10 @@ final class ARSceneManager: NSObject {
                 heightMeters: Double(plane.extent.z)
             )
         }
-        
-        // === 5. Exportar esquinas ===
+
+        // 4. Esquinas
         let offsiteCorners: [OffsiteCornerData] = detectedCorners.map { corner in
-            let p = sceneView.projectPoint(SCNVector3(corner.position))
-            let pos2D = NormalizedPoint(x: Double(p.x) / Double(w), y: Double(p.y) / Double(h))
+            let pos2D = projectNormalized(SCNVector3(corner.position))
             return OffsiteCornerData(
                 position3D: corner.position,
                 position2D: pos2D,
@@ -1224,13 +1238,13 @@ final class ARSceneManager: NSObject {
                 planeIdB: corner.planeB.identifier.uuidString
             )
         }
-        
-        // === 6. Dimensiones de paredes ===
+
+        // 5. Dimensiones de paredes
         let wallDims: [OffsiteWallDimension] = detectedPlanes.filter { $0.alignment == .vertical }.map { plane in
             let edges = getPlaneEdgePoints(plane)
             let verts = edges.map { pt -> [Double] in
-                let p = sceneView.projectPoint(SCNVector3(pt))
-                return [Double(p.x) / Double(w), Double(p.y) / Double(h)]
+                let np = projectNormalized(SCNVector3(pt))
+                return [np.x, np.y]
             }
             return OffsiteWallDimension(
                 planeId: plane.identifier.uuidString,
@@ -1239,19 +1253,37 @@ final class ARSceneManager: NSObject {
                 vertices2D: verts
             )
         }
-        
-        // === 7. Datos de cámara ===
-        var cameraData: OffsiteCameraData?
-        if let frame = sceneView.session.currentFrame {
-            cameraData = OffsiteCameraData(
-                intrinsics: frame.camera.intrinsics,
-                transform: frame.camera.transform,
-                imageWidth: Int(w * scale),
-                imageHeight: Int(h * scale)
-            )
+
+        // 6. Datos de cámara (usar resolución real del capturedImage)
+        let cameraData = OffsiteCameraData(
+            intrinsics: camera.intrinsics,
+            transform: camera.transform,
+            imageWidth: Int(imageW),
+            imageHeight: Int(imageH)
+        )
+
+        // 7. Depth map (CVPixelBuffer Float32 → Data)
+        var depthMapData: Data?
+        var depthMapWidth: Int = 0
+        var depthMapHeight: Int = 0
+        if let sceneDepth = currentFrame.smoothedSceneDepth ?? currentFrame.sceneDepth {
+            let depthBuffer = sceneDepth.depthMap
+            CVPixelBufferLockBaseAddress(depthBuffer, .readOnly)
+            defer { CVPixelBufferUnlockBaseAddress(depthBuffer, .readOnly) }
+            depthMapWidth = CVPixelBufferGetWidth(depthBuffer)
+            depthMapHeight = CVPixelBufferGetHeight(depthBuffer)
+            let bytesPerRow = CVPixelBufferGetBytesPerRow(depthBuffer)
+            if let baseAddress = CVPixelBufferGetBaseAddress(depthBuffer) {
+                var data = Data(capacity: depthMapWidth * depthMapHeight * MemoryLayout<Float>.size)
+                for row in 0..<depthMapHeight {
+                    let rowPtr = baseAddress.advanced(by: row * bytesPerRow)
+                    data.append(UnsafeBufferPointer(start: rowPtr.assumingMemoryBound(to: Float.self), count: depthMapWidth))
+                }
+                depthMapData = data
+            }
         }
-        
-        // === 8. Metadata del LiDAR ===
+
+        // 8. Metadata del LiDAR
         let planeDims = detectedPlanes.map { plane in
             PlaneDimension(width: Double(plane.extent.x), height: Double(plane.extent.z))
         }
@@ -1260,41 +1292,91 @@ final class ARSceneManager: NSObject {
             planeCount: detectedPlanes.count,
             planeDimensions: planeDims
         )
-        
-        // === 9. Crear snapshot completo ===
-        let snapshot = OffsiteSceneSnapshot(
-            capturedAt: Date(),
-            camera: cameraData,
-            planes: offsitePlanes,
-            corners: offsiteCorners,
-            wallDimensions: wallDims,
-            measurements: offsiteMeasurements,
-            perspectiveFrames: perspFrames,
-            frames: offsiteFrames,
-            textAnnotations: [],
-            lidarMetadata: lidarMetadata,
-            imageScale: Double(scale)
-        )
-        
-        let captureData = OffsiteCaptureData(
-            capturedAt: Date(),
-            measurements: offsiteMeasurements,
-            frames: offsiteFrames,
-            textAnnotations: [],
-            lidarMetadata: lidarMetadata,
-            imageScale: Double(scale),
-            sceneSnapshot: snapshot
-        )
 
-        // Delegar persistencia al StorageService
-        do {
-            let files = try storageService.createCaptureFiles(image: image)
-            try storageService.saveCaptureData(captureData, to: files.jsonURL)
-            logger.info("Captura offsite guardada: \(files.baseName) con \(offsitePlanes.count) planos, \(offsiteCorners.count) esquinas")
-            return (files.imageURL, files.jsonURL)
-        } catch {
-            logger.error("Error en captura offsite: \(error.localizedDescription)")
-            throw CaptureError.saveFailed(error)
+        let imageScaleValue = Double(imageW / sceneView.bounds.width)
+        let planeCount = offsitePlanes.count
+        let cornerCount = offsiteCorners.count
+        let capturesDir = storageService.capturesDirectory
+
+        // === FASE 2: Background — base64, modelos, JSON, file IO ===
+        return try await withCheckedThrowingContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                do {
+                    // Construir perspectiveFrames con base64 (CPU-bound, fuera de main)
+                    let perspFrames: [OffsiteFramePerspective] = intermediateFrames.map { frame in
+                        OffsiteFramePerspective(
+                            id: frame.id,
+                            planeId: frame.planeId,
+                            center2D: frame.center2D,
+                            corners2D: frame.corners2D,
+                            widthMeters: frame.widthMeters,
+                            heightMeters: frame.heightMeters,
+                            imageBase64: frame.imageJPEGData?.base64EncodedString(),
+                            label: nil,
+                            color: "#3B82F6"
+                        )
+                    }
+
+                    // Preparar baseName antes de snapshot para poder referenciar el depth filename
+                    try FileManager.default.createDirectory(at: capturesDir, withIntermediateDirectories: true)
+                    let formatter = DateFormatter()
+                    formatter.dateFormat = AppConstants.Capture.dateFormat
+                    let baseName = "\(AppConstants.Capture.filePrefix)\(formatter.string(from: Date()))"
+
+                    var snapshot = OffsiteSceneSnapshot(
+                        capturedAt: Date(),
+                        camera: cameraData,
+                        planes: offsitePlanes,
+                        corners: offsiteCorners,
+                        wallDimensions: wallDims,
+                        measurements: offsiteMeasurements,
+                        perspectiveFrames: perspFrames,
+                        frames: offsiteFrames,
+                        textAnnotations: [],
+                        lidarMetadata: lidarMetadata,
+                        imageScale: imageScaleValue
+                    )
+
+                    // Guardar depth map si existe y registrar en snapshot
+                    if let dmData = depthMapData, depthMapWidth > 0, depthMapHeight > 0 {
+                        let depthFilename = "\(baseName).depth"
+                        let depthURL = capturesDir.appendingPathComponent(depthFilename)
+                        try? dmData.write(to: depthURL)
+                        snapshot.depthMapFilename = depthFilename
+                        snapshot.depthMapWidth = depthMapWidth
+                        snapshot.depthMapHeight = depthMapHeight
+                    }
+
+                    let captureData = OffsiteCaptureData(
+                        capturedAt: Date(),
+                        measurements: offsiteMeasurements,
+                        frames: offsiteFrames,
+                        textAnnotations: [],
+                        lidarMetadata: lidarMetadata,
+                        imageScale: imageScaleValue,
+                        sceneSnapshot: snapshot
+                    )
+
+                    let imageURL = capturesDir.appendingPathComponent("\(baseName).jpg")
+                    let jsonURL = capturesDir.appendingPathComponent("\(baseName).json")
+                    let thumbURL = capturesDir.appendingPathComponent("\(baseName)_thumb.jpg")
+
+                    try captureImageData.write(to: imageURL)
+
+                    let encoder = JSONEncoder()
+                    encoder.dateEncodingStrategy = .iso8601
+                    encoder.outputFormatting = .prettyPrinted
+                    try encoder.encode(captureData).write(to: jsonURL)
+
+                    if let td = thumbnailData {
+                        try? td.write(to: thumbURL)
+                    }
+
+                    continuation.resume(returning: (imageURL, jsonURL))
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
         }
     }
     
@@ -1830,7 +1912,9 @@ extension ARSceneManager: ARSessionDelegate {
     }
     
     func session(_ session: ARSession, cameraDidChangeTrackingState camera: ARCamera) {
-        // Opcional: avisar a la UI si tracking es limitado
+        Task { @MainActor in
+            currentTrackingState = camera.trackingState
+        }
     }
 }
 

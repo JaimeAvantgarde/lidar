@@ -14,6 +14,8 @@ struct ContentView: View {
     @State private var panelExpanded = true
     @State private var showOffsiteSheet = false
     @State private var offsiteCaptureAlert: String?
+    @State private var isCapturing = false
+    @State private var showPoorQualityConfirmation = false
 
     enum AppSection: String, CaseIterable {
         case planos = "Planos"
@@ -77,12 +79,41 @@ struct ContentView: View {
             if !panelExpanded || sceneManager.moveModeForFrameId != nil || sceneManager.isMeasurementMode || sceneManager.isVinylMode {
                 floatingHint
             }
+
+            // Spinner de captura
+            if isCapturing {
+                Color.black.opacity(0.4)
+                    .ignoresSafeArea()
+                    .allowsHitTesting(true)
+                VStack(spacing: 16) {
+                    ProgressView()
+                        .controlSize(.large)
+                        .tint(.white)
+                    Text("Capturando escena\u{2026}")
+                        .font(.headline)
+                        .foregroundStyle(.white)
+                }
+                .padding(32)
+                .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 20))
+            }
         }
         .sheet(isPresented: $showPlaneInfo) {
             planeInfoSheet
         }
         .fullScreenCover(isPresented: $showOffsiteSheet) {
             OffsiteCapturesListView()
+        }
+        .confirmationDialog(
+            "Calidad de captura baja",
+            isPresented: $showPoorQualityConfirmation,
+            titleVisibility: .visible
+        ) {
+            Button("Capturar de todas formas") {
+                performCapture()
+            }
+            Button("Cancelar", role: .cancel) {}
+        } message: {
+            Text("La escena tiene pocos datos (planos, mediciones o tracking limitado). La captura puede tener menos precision.")
         }
         .alert("Offsite", isPresented: Binding(
             get: { offsiteCaptureAlert != nil },
@@ -157,43 +188,17 @@ struct ContentView: View {
 
             // Capturar para offsite
             Button {
-                do {
-                    _ = try sceneManager.captureForOffsite()
-                    HapticService.shared.notification(type: .success)
-                    let measurementCount = sceneManager.measurements.count
-                    let frameCount = sceneManager.placedFrames.count
-                    let planeCount = sceneManager.detectedPlaneAnchors.count
-                    let cornerCount = sceneManager.detectedCorners.count
-                    var parts: [String] = []
-                    if measurementCount > 0 {
-                        parts.append(measurementCount == 1 ? "1 medición" : "\(measurementCount) mediciones")
-                    }
-                    if frameCount > 0 {
-                        parts.append(frameCount == 1 ? "1 cuadro" : "\(frameCount) cuadros")
-                    }
-                    if planeCount > 0 {
-                        parts.append(planeCount == 1 ? "1 plano" : "\(planeCount) planos")
-                    }
-                    if cornerCount > 0 {
-                        parts.append(cornerCount == 1 ? "1 esquina" : "\(cornerCount) esquinas")
-                    }
-                    let summary = parts.isEmpty ? "datos de escena" : parts.joined(separator: ", ")
-                    offsiteCaptureAlert = "✓ Captura guardada con \(summary). Puedes verla en «Ver capturas»."
-                } catch ARSceneManager.CaptureError.noSceneView {
-                    HapticService.shared.notification(type: .error)
-                    offsiteCaptureAlert = "Error: Vista AR no disponible"
-                } catch ARSceneManager.CaptureError.invalidBounds {
-                    HapticService.shared.notification(type: .error)
-                    offsiteCaptureAlert = "Error: Tamaño de vista inválido"
-                } catch ARSceneManager.CaptureError.imageEncodingFailed {
-                    HapticService.shared.notification(type: .error)
-                    offsiteCaptureAlert = "Error: No se pudo codificar la imagen"
-                } catch {
-                    HapticService.shared.notification(type: .error)
-                    offsiteCaptureAlert = "Error al guardar: \(error.localizedDescription)"
+                if sceneManager.captureQualityLevel == .poor {
+                    showPoorQualityConfirmation = true
+                } else {
+                    performCapture()
                 }
             } label: {
                 HStack(spacing: 4) {
+                    // Indicador de calidad
+                    Circle()
+                        .fill(qualityColor)
+                        .frame(width: 8, height: 8)
                     Image(systemName: "camera.viewfinder")
                         .font(.subheadline)
                     if captureDataCount > 0 {
@@ -204,7 +209,7 @@ struct ContentView: View {
                 }
                 .glassPill()
             }
-            .disabled(!canCapture)
+            .disabled(!canCapture || isCapturing)
             .opacity(canCapture ? 1.0 : 0.5)
             .accessibilityLabel("Capturar para offsite")
             .accessibilityHint(canCapture ? "Guarda la escena actual con \(captureDataCount) elementos" : "Necesitas al menos una medición o plano detectado para capturar")
@@ -413,6 +418,57 @@ struct ContentView: View {
 
     private var captureDataCount: Int {
         sceneManager.measurements.count + sceneManager.placedFrames.count + sceneManager.detectedPlaneAnchors.count
+    }
+
+    private var qualityColor: Color {
+        switch sceneManager.captureQualityLevel {
+        case .poor: return .red
+        case .fair: return .yellow
+        case .good: return .green
+        }
+    }
+
+    private func performCapture() {
+        guard !isCapturing else { return }
+        isCapturing = true
+        Task {
+            do {
+                _ = try await sceneManager.captureForOffsite()
+                HapticService.shared.notification(type: .success)
+                let measurementCount = sceneManager.measurements.count
+                let frameCount = sceneManager.placedFrames.count
+                let planeCount = sceneManager.detectedPlaneAnchors.count
+                let cornerCount = sceneManager.detectedCorners.count
+                var parts: [String] = []
+                if measurementCount > 0 {
+                    parts.append(measurementCount == 1 ? "1 medición" : "\(measurementCount) mediciones")
+                }
+                if frameCount > 0 {
+                    parts.append(frameCount == 1 ? "1 cuadro" : "\(frameCount) cuadros")
+                }
+                if planeCount > 0 {
+                    parts.append(planeCount == 1 ? "1 plano" : "\(planeCount) planos")
+                }
+                if cornerCount > 0 {
+                    parts.append(cornerCount == 1 ? "1 esquina" : "\(cornerCount) esquinas")
+                }
+                let summary = parts.isEmpty ? "datos de escena" : parts.joined(separator: ", ")
+                offsiteCaptureAlert = "✓ Captura guardada con \(summary). Puedes verla en «Ver capturas»."
+            } catch ARSceneManager.CaptureError.noSceneView {
+                HapticService.shared.notification(type: .error)
+                offsiteCaptureAlert = "Error: Vista AR no disponible"
+            } catch ARSceneManager.CaptureError.invalidBounds {
+                HapticService.shared.notification(type: .error)
+                offsiteCaptureAlert = "Error: Tamaño de vista inválido"
+            } catch ARSceneManager.CaptureError.imageEncodingFailed {
+                HapticService.shared.notification(type: .error)
+                offsiteCaptureAlert = "Error: No se pudo codificar la imagen"
+            } catch {
+                HapticService.shared.notification(type: .error)
+                offsiteCaptureAlert = "Error al guardar: \(error.localizedDescription)"
+            }
+            isCapturing = false
+        }
     }
 
     // MARK: - Banner de error

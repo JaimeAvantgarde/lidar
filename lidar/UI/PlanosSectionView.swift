@@ -44,6 +44,7 @@ struct PlanosSectionView: View {
                     .sheet(isPresented: $showFloorPlan) {
                         FloorPlanView(floorPlanData: FloorPlanGenerator.generate(
                             from: sceneManager.detectedPlanes,
+                            corners: sceneManager.detectedCorners,
                             classifyPlane: { sceneManager.classifyPlane($0) },
                             roomSummary: sceneManager.estimateRoomSummary()
                         ))

@@ -32,6 +32,14 @@ protocol StorageServiceProtocol: Sendable {
     func loadFrameImage(captureId: String, filename: String) -> UIImage?
     /// Elimina la imagen de un cuadro.
     func deleteFrameImage(captureId: String, filename: String)
+    /// Sobreescribe la imagen .jpg de una captura y regenera el thumbnail.
+    func updateCaptureImage(_ image: UIImage, for entry: OffsiteCaptureEntry) throws
+    /// Actualiza solo el thumbnail de una captura (sin tocar la imagen original).
+    func updateCaptureThumbnail(_ image: UIImage, for entry: OffsiteCaptureEntry) throws
+    /// Guarda el depth map como archivo .depth junto a la captura.
+    func saveDepthMap(_ data: Data, captureId: String) throws -> String
+    /// Carga el depth map desde disco.
+    func loadDepthMap(captureId: String, filename: String) -> Data?
 }
 
 // MARK: - Supporting Types
@@ -114,8 +122,9 @@ final class StorageService: StorageServiceProtocol, @unchecked Sendable {
     func deleteCapture(_ entry: OffsiteCaptureEntry) {
         let thumbURL = thumbnailURL(for: entry.imageURL)
         let framesDir = framesDirectory(for: entry.id)
+        let depthURL = capturesDirectory.appendingPathComponent("\(entry.id).depth")
 
-        for url in [entry.imageURL, entry.jsonURL, thumbURL] {
+        for url in [entry.imageURL, entry.jsonURL, thumbURL, depthURL] {
             do {
                 if fileManager.fileExists(atPath: url.path) {
                     try fileManager.removeItem(at: url)
@@ -223,6 +232,43 @@ final class StorageService: StorageServiceProtocol, @unchecked Sendable {
         try? fileManager.removeItem(at: fileURL)
     }
 
+    func updateCaptureImage(_ image: UIImage, for entry: OffsiteCaptureEntry) throws {
+        guard let jpeg = image.jpegData(compressionQuality: AppConstants.Capture.jpegQuality) else {
+            throw StorageError.imageEncodingFailed
+        }
+        try jpeg.write(to: entry.imageURL)
+
+        // Regenerar thumbnail
+        let thumbURL = thumbnailURL(for: entry.imageURL)
+        if let thumbnail = image.preparingThumbnail(of: AppConstants.Capture.thumbnailSize),
+           let thumbData = thumbnail.jpegData(compressionQuality: AppConstants.Capture.thumbnailQuality) {
+            try? thumbData.write(to: thumbURL)
+        }
+        logger.info("Imagen de captura actualizada: \(entry.id)")
+    }
+
+    func updateCaptureThumbnail(_ image: UIImage, for entry: OffsiteCaptureEntry) throws {
+        let thumbURL = thumbnailURL(for: entry.imageURL)
+        if let thumbnail = image.preparingThumbnail(of: AppConstants.Capture.thumbnailSize),
+           let thumbData = thumbnail.jpegData(compressionQuality: AppConstants.Capture.thumbnailQuality) {
+            try thumbData.write(to: thumbURL)
+        }
+        logger.info("Thumbnail actualizado: \(entry.id)")
+    }
+
+    func saveDepthMap(_ data: Data, captureId: String) throws -> String {
+        let filename = "\(captureId).depth"
+        let fileURL = capturesDirectory.appendingPathComponent(filename)
+        try data.write(to: fileURL)
+        logger.info("Depth map guardado: \(filename) (\(data.count) bytes)")
+        return filename
+    }
+
+    func loadDepthMap(captureId: String, filename: String) -> Data? {
+        let fileURL = capturesDirectory.appendingPathComponent(filename)
+        return try? Data(contentsOf: fileURL)
+    }
+
     // MARK: - Helpers
 
     private func thumbnailURL(for imageURL: URL) -> URL {
@@ -284,6 +330,16 @@ final class MockStorageService: StorageServiceProtocol, @unchecked Sendable {
     }
 
     func deleteFrameImage(captureId: String, filename: String) {}
+
+    func updateCaptureImage(_ image: UIImage, for entry: OffsiteCaptureEntry) throws {}
+
+    func updateCaptureThumbnail(_ image: UIImage, for entry: OffsiteCaptureEntry) throws {}
+
+    func saveDepthMap(_ data: Data, captureId: String) throws -> String {
+        "\(captureId).depth"
+    }
+
+    func loadDepthMap(captureId: String, filename: String) -> Data? { nil }
 
     func reset() {
         mockEntries = []

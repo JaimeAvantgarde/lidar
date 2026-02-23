@@ -289,6 +289,12 @@ struct OffsiteSceneSnapshot: Codable, Equatable {
     let imageScale: Double
     /// Última modificación
     var lastModified: Date?
+    /// Nombre del archivo del depth map (opcional, para escala local por profundidad)
+    var depthMapFilename: String?
+    /// Ancho del depth map en pixeles
+    var depthMapWidth: Int?
+    /// Alto del depth map en pixeles
+    var depthMapHeight: Int?
     
     /// Escala metros/pixel calculada promediando TODAS las mediciones AR.
     /// Convierte coordenadas normalizadas a pixeles reales (usando camera.imageWidth/Height)

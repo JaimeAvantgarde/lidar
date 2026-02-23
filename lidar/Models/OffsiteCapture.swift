@@ -178,6 +178,7 @@ enum SelectableItemType: Equatable {
     case measurement(UUID)
     case measurementEndpointA(UUID)
     case measurementEndpointB(UUID)
+    case measurementRotate(UUID)
     case frame(UUID)
     case frameResizeBottomRight(UUID)
     case perspectiveFrame(UUID)
@@ -187,6 +188,7 @@ enum SelectableItemType: Equatable {
     var itemId: UUID {
         switch self {
         case .measurement(let id), .measurementEndpointA(let id), .measurementEndpointB(let id),
+             .measurementRotate(let id),
              .frame(let id), .frameResizeBottomRight(let id),
              .perspectiveFrame(let id), .textAnnotation(let id):
             return id

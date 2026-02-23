@@ -14,9 +14,9 @@ import CoreGraphics
 struct FloorPlanWallSegment: Identifiable, Equatable {
     let id: UUID
     /// Punto inicial en metros (plano XZ)
-    let start: CGPoint
+    var start: CGPoint
     /// Punto final en metros (plano XZ)
-    let end: CGPoint
+    var end: CGPoint
     /// Grosor de la pared en metros
     let thickness: CGFloat
     /// Clasificación semántica del plano original
@@ -25,8 +25,10 @@ struct FloorPlanWallSegment: Identifiable, Equatable {
     let widthMeters: CGFloat
     /// Alto real del plano (metros)
     let heightMeters: CGFloat
+    /// ID del plano AR original (para corner snapping)
+    let planeId: String?
 
-    init(id: UUID = UUID(), start: CGPoint, end: CGPoint, thickness: CGFloat = 0.15, classification: PlaneClassification = .wall, widthMeters: CGFloat = 0, heightMeters: CGFloat = 0) {
+    init(id: UUID = UUID(), start: CGPoint, end: CGPoint, thickness: CGFloat = 0.15, classification: PlaneClassification = .wall, widthMeters: CGFloat = 0, heightMeters: CGFloat = 0, planeId: String? = nil) {
         self.id = id
         self.start = start
         self.end = end
@@ -34,6 +36,7 @@ struct FloorPlanWallSegment: Identifiable, Equatable {
         self.classification = classification
         self.widthMeters = widthMeters
         self.heightMeters = heightMeters
+        self.planeId = planeId
     }
 
     /// Longitud del segmento en metros.

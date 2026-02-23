@@ -192,10 +192,18 @@ enum AppConstants {
         static let framePhotoJPEGQuality: CGFloat = 0.7
         /// Dimensión máxima de foto de cuadro (pixeles)
         static let framePhotoMaxDimension: CGFloat = 800
+        /// Radio relajado para iniciar drag sobre item ya seleccionado (puntos)
+        static let relaxedDragRadius: CGFloat = 60
         /// Escala mínima de zoom (1x = sin zoom)
         static let minZoomScale: CGFloat = 1.0
         /// Escala máxima de zoom
         static let maxZoomScale: CGFloat = 5.0
+        /// Magnificación de la lupa (2.5x)
+        static let magnifierZoom: CGFloat = 2.5
+        /// Diámetro de la lupa en puntos
+        static let magnifierDiameter: CGFloat = 120
+        /// Offset vertical de la lupa respecto al dedo (hacia arriba)
+        static let magnifierOffsetY: CGFloat = 100
     }
 
     // MARK: - Point Cloud (Depth Mesh)
@@ -228,6 +236,8 @@ enum AppConstants {
         static let gridSpacing: CGFloat = 1.0
         /// Padding del bounding box (metros)
         static let boundsPadding: CGFloat = 0.3
+        /// Distancia máxima para unir endpoints por proximidad (metros)
+        static let proximityJoinThreshold: CGFloat = 0.2
     }
 
     // MARK: - Animation

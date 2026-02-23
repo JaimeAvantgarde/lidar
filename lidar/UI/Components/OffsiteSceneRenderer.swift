@@ -18,29 +18,68 @@ final class PerspectiveImageCache {
     static let shared = PerspectiveImageCache()
     private var cache: [UUID: UIImage] = [:]
     private var cornerKeys: [UUID: String] = [:]
+    private var accessOrder: [UUID] = []
+    private let maxEntries = 20
     private let context = CIContext()
 
     func image(for frameId: UUID, sourceImage: UIImage, corners: [CGPoint], boundingRect: CGRect) -> UIImage? {
         let key = corners.map { "\(Int($0.x)),\(Int($0.y))" }.joined(separator: "|")
         if let cached = cache[frameId], cornerKeys[frameId] == key {
+            // Mover al final (más reciente)
+            if let idx = accessOrder.firstIndex(of: frameId) {
+                accessOrder.remove(at: idx)
+                accessOrder.append(frameId)
+            }
             return cached
         }
 
         guard let result = applyPerspectiveTransform(sourceImage, to: corners, in: boundingRect) else {
             return nil
         }
+
+        // Evict si se supera el límite
+        if cache.count >= maxEntries, let oldest = accessOrder.first {
+            cache.removeValue(forKey: oldest)
+            cornerKeys.removeValue(forKey: oldest)
+            accessOrder.removeFirst()
+        }
+
         cache[frameId] = result
         cornerKeys[frameId] = key
+        accessOrder.append(frameId)
         return result
     }
 
     func invalidate(frameId: UUID) {
         cache.removeValue(forKey: frameId)
         cornerKeys.removeValue(forKey: frameId)
+        accessOrder.removeAll { $0 == frameId }
+    }
+
+    /// Verifica que 4 puntos forman un cuadrilátero convexo (producto cruzado mismo signo en todos los edges).
+    private func isConvexQuadrilateral(_ corners: [CGPoint]) -> Bool {
+        guard corners.count == 4 else { return false }
+        var sign: Bool?
+        for i in 0..<4 {
+            let a = corners[i]
+            let b = corners[(i + 1) % 4]
+            let c = corners[(i + 2) % 4]
+            let cross = (b.x - a.x) * (c.y - b.y) - (b.y - a.y) * (c.x - b.x)
+            if abs(cross) < 1e-6 { continue } // colineales, ignorar
+            let positive = cross > 0
+            if let s = sign {
+                if s != positive { return false }
+            } else {
+                sign = positive
+            }
+        }
+        return sign != nil
     }
 
     private func applyPerspectiveTransform(_ image: UIImage, to corners: [CGPoint], in rect: CGRect) -> UIImage? {
-        guard corners.count == 4, let ciImage = CIImage(image: image) else { return nil }
+        guard corners.count == 4,
+              isConvexQuadrilateral(corners),
+              let ciImage = CIImage(image: image) else { return nil }
 
         let imgW = ciImage.extent.width
         let imgH = ciImage.extent.height
@@ -83,6 +122,7 @@ struct PlaneOverlayView: View {
     let scale: CGFloat
     let offset: CGPoint
     let showDimensions: Bool
+    var overlayScale: CGFloat = 1.0
     let onTap: () -> Void
     
     var body: some View {
@@ -122,8 +162,8 @@ struct PlaneOverlayView: View {
                 .stroke(
                     planeColor.opacity(isSelected ? 0.9 : 0.5),
                     style: StrokeStyle(
-                        lineWidth: isSelected ? 3 : AppConstants.OffsiteEditor.planeOutlineLineWidth,
-                        dash: isSelected ? [] : [8, 4]
+                        lineWidth: (isSelected ? 3 : AppConstants.OffsiteEditor.planeOutlineLineWidth) * overlayScale,
+                        dash: isSelected ? [] : [8 * overlayScale, 4 * overlayScale]
                     )
                 )
             }
@@ -133,19 +173,19 @@ struct PlaneOverlayView: View {
                 let center = centroid(vertices)
                 VStack(spacing: 2) {
                     Text(plane.classification.displayName)
-                        .font(.caption2)
+                        .font(.system(size: 10 * overlayScale))
                         .fontWeight(.bold)
                     Text(plane.dimensionsText)
-                        .font(.caption)
+                        .font(.system(size: 12 * overlayScale))
                         .fontWeight(.semibold)
                     if plane.isVertical {
                         Text(String(format: "%.1f m²", plane.widthMeters * plane.heightMeters))
-                            .font(.caption2)
+                            .font(.system(size: 10 * overlayScale))
                     }
                 }
                 .foregroundStyle(.white)
-                .padding(.horizontal, 8)
-                .padding(.vertical, 4)
+                .padding(.horizontal, 8 * overlayScale)
+                .padding(.vertical, 4 * overlayScale)
                 .background(planeColor.opacity(0.85), in: RoundedRectangle(cornerRadius: 6))
                 .position(center)
             }
@@ -167,31 +207,29 @@ struct CornerOverlayView: View {
     let imageSize: CGSize
     let scale: CGFloat
     let offset: CGPoint
-    
+    var overlayScale: CGFloat = 1.0
+
     var body: some View {
         let pos = CGPoint(
             x: corner.position2D.x * imageSize.width * scale + offset.x,
             y: corner.position2D.y * imageSize.height * scale + offset.y
         )
-        
+
         ZStack {
-            // Marcador de esquina
             Image(systemName: "angle")
-                .font(.system(size: 14, weight: .bold))
+                .font(.system(size: 14 * overlayScale, weight: .bold))
                 .foregroundStyle(.yellow)
-                .padding(4)
+                .padding(4 * overlayScale)
                 .background(Color.black.opacity(0.7), in: Circle())
                 .position(pos)
-            
-            // Etiqueta del ángulo
+
             Text(String(format: "%.0f°", corner.angleDegrees))
-                .font(.caption2)
-                .fontWeight(.bold)
+                .font(.system(size: 10 * overlayScale, weight: .bold))
                 .foregroundStyle(.yellow)
-                .padding(.horizontal, 4)
-                .padding(.vertical, 2)
+                .padding(.horizontal, 4 * overlayScale)
+                .padding(.vertical, 2 * overlayScale)
                 .background(Color.black.opacity(0.7), in: RoundedRectangle(cornerRadius: 4))
-                .position(x: pos.x + 20, y: pos.y - 16)
+                .position(x: pos.x + 20 * overlayScale, y: pos.y - 16 * overlayScale)
         }
     }
 }
@@ -205,6 +243,7 @@ struct WallDimensionOverlayView: View {
     let scale: CGFloat
     let offset: CGPoint
     let unit: MeasurementUnit
+    var overlayScale: CGFloat = 1.0
     
     var body: some View {
         let vertices = wall.vertices2D.map { pt -> CGPoint in
@@ -227,52 +266,49 @@ struct WallDimensionOverlayView: View {
                     path.move(to: CGPoint(x: vertices[0].x, y: topMid.y))
                     path.addLine(to: CGPoint(x: vertices[1].x, y: topMid.y))
                 }
-                .stroke(Color.orange, style: StrokeStyle(lineWidth: AppConstants.OffsiteEditor.planeDimensionLineWidth))
-                
+                .stroke(Color.orange, style: StrokeStyle(lineWidth: AppConstants.OffsiteEditor.planeDimensionLineWidth * overlayScale))
+
                 // Etiqueta ancho
                 Text(unit.format(distanceMeters: Float(wall.widthMeters)))
-                    .font(.caption2)
-                    .fontWeight(.bold)
+                    .font(.system(size: 10 * overlayScale, weight: .bold))
                     .foregroundStyle(.white)
-                    .padding(.horizontal, 4)
-                    .padding(.vertical, 2)
+                    .padding(.horizontal, 4 * overlayScale)
+                    .padding(.vertical, 2 * overlayScale)
                     .background(Color.orange.opacity(0.85), in: RoundedRectangle(cornerRadius: 4))
                     .position(topMid)
-                
+
                 // Línea de cota vertical (alto)
                 let leftMid = CGPoint(
                     x: min(vertices[0].x, vertices[2].x) - 20,
                     y: (vertices[0].y + vertices[2].y) / 2
                 )
-                
+
                 Path { path in
                     path.move(to: CGPoint(x: leftMid.x, y: vertices[0].y))
                     path.addLine(to: CGPoint(x: leftMid.x, y: vertices[2].y))
                 }
-                .stroke(Color.orange, style: StrokeStyle(lineWidth: AppConstants.OffsiteEditor.planeDimensionLineWidth))
-                
+                .stroke(Color.orange, style: StrokeStyle(lineWidth: AppConstants.OffsiteEditor.planeDimensionLineWidth * overlayScale))
+
                 // Etiqueta alto
                 Text(unit.format(distanceMeters: Float(wall.heightMeters)))
-                    .font(.caption2)
-                    .fontWeight(.bold)
+                    .font(.system(size: 10 * overlayScale, weight: .bold))
                     .foregroundStyle(.white)
-                    .padding(.horizontal, 4)
-                    .padding(.vertical, 2)
+                    .padding(.horizontal, 4 * overlayScale)
+                    .padding(.vertical, 2 * overlayScale)
                     .background(Color.orange.opacity(0.85), in: RoundedRectangle(cornerRadius: 4))
                     .position(leftMid)
-                
+
                 // Área
                 let center = CGPoint(
                     x: (vertices[0].x + vertices[1].x + vertices[2].x + vertices[3].x) / 4,
                     y: (vertices[0].y + vertices[1].y + vertices[2].y + vertices[3].y) / 4
                 )
-                
+
                 Text(String(format: "%.1f m²", wall.widthMeters * wall.heightMeters))
-                    .font(.caption2)
-                    .fontWeight(.semibold)
+                    .font(.system(size: 10 * overlayScale, weight: .semibold))
                     .foregroundStyle(.orange)
-                    .padding(.horizontal, 6)
-                    .padding(.vertical, 3)
+                    .padding(.horizontal, 6 * overlayScale)
+                    .padding(.vertical, 3 * overlayScale)
                     .background(Color.black.opacity(0.6), in: RoundedRectangle(cornerRadius: 4))
                     .position(x: center.x, y: center.y + 20)
             }
@@ -291,6 +327,7 @@ struct PerspectiveFrameOverlayView: View {
     let isSelected: Bool
     let isEditMode: Bool
     let loadedImage: UIImage?
+    var overlayScale: CGFloat = 1.0
     let onDelete: () -> Void
     
     var body: some View {
@@ -344,41 +381,41 @@ struct PerspectiveFrameOverlayView: View {
                 }
                 .stroke(
                     Color(hex: frame.color),
-                    lineWidth: isSelected ? 4 : 2
+                    lineWidth: (isSelected ? 4 : 2) * overlayScale
                 )
-                
+
                 // Etiqueta
                 let center = CGPoint(
                     x: corners.reduce(0) { $0 + $1.x } / 4,
                     y: corners.reduce(0) { $0 + $1.y } / 4
                 )
-                
+
                 VStack(spacing: 1) {
                     if let label = frame.label {
                         Text(label)
-                            .font(.caption2)
+                            .font(.system(size: 10 * overlayScale))
                             .fontWeight(.semibold)
                     }
                     Text(String(format: "%.2f × %.2f m", frame.widthMeters, frame.heightMeters))
-                        .font(.caption2)
+                        .font(.system(size: 10 * overlayScale))
                 }
                 .foregroundStyle(.white)
-                .padding(.horizontal, 6)
-                .padding(.vertical, 3)
+                .padding(.horizontal, 6 * overlayScale)
+                .padding(.vertical, 3 * overlayScale)
                 .background(Color(hex: frame.color).opacity(0.8), in: RoundedRectangle(cornerRadius: 4))
-                .position(x: center.x, y: (corners.map(\.y).min() ?? center.y) - 16)
-                
+                .position(x: center.x, y: (corners.map(\.y).min() ?? center.y) - 16 * overlayScale)
+
                 // Edit mode buttons
                 if isEditMode {
                     Button(action: onDelete) {
                         Image(systemName: "xmark.circle.fill")
-                            .font(.title3)
+                            .font(.system(size: 20 * overlayScale))
                             .foregroundStyle(.red)
                             .background(Circle().fill(.white))
                     }
                     .position(x: corners[1].x + 8, y: corners[1].y - 8)
                 }
-                
+
                 if isSelected {
                     Path { path in
                         path.move(to: corners[0])
@@ -387,7 +424,7 @@ struct PerspectiveFrameOverlayView: View {
                         }
                         path.closeSubpath()
                     }
-                    .stroke(Color.yellow, lineWidth: 3)
+                    .stroke(Color.yellow, lineWidth: 3 * overlayScale)
                 }
             }
         }
@@ -427,6 +464,7 @@ struct EnhancedMeasurementOverlay: View {
     let unit: MeasurementUnit
     let isEditMode: Bool
     var isSelected: Bool = false
+    var overlayScale: CGFloat = 1.0
     let onDelete: () -> Void
 
     var body: some View {
@@ -449,56 +487,99 @@ struct EnhancedMeasurementOverlay: View {
                 path.move(to: pA)
                 path.addLine(to: pB)
             }
-            .stroke(glowColor.opacity(isSelected ? 0.6 : 0.3), lineWidth: isSelected ? 8 : (measurement.isFromAR ? 6 : 4))
+            .stroke(glowColor.opacity(isSelected ? 0.6 : 0.3), lineWidth: (isSelected ? 8 : (measurement.isFromAR ? 6 : 4)) * overlayScale)
 
             Path { path in
                 path.move(to: pA)
                 path.addLine(to: pB)
             }
-            .stroke(isSelected ? Color.yellow : lineColor, lineWidth: measurement.isFromAR ? 2.5 : 2)
+            .stroke(isSelected ? Color.yellow : lineColor, lineWidth: (measurement.isFromAR ? 2.5 : 2) * overlayScale)
 
             // Endpoints
             if isSelected {
-                DragHandleView()
+                DragHandleView(overlayScale: overlayScale)
                     .position(pA)
-                DragHandleView()
+                DragHandleView(overlayScale: overlayScale)
                     .position(pB)
+                // Handle de rotación (perpendicular al midpoint)
+                RotationHandleView(overlayScale: overlayScale)
+                    .position(rotationHandlePosition(pA: pA, pB: pB))
             } else {
-                MeasurementEndpoint(color: .orange)
+                MeasurementEndpoint(color: .orange, overlayScale: overlayScale)
                     .position(pA)
-                MeasurementEndpoint(color: lineColor)
+                MeasurementEndpoint(color: lineColor, overlayScale: overlayScale)
                     .position(pB)
             }
 
             // Label
             VStack(spacing: 2) {
                 Text(unit.format(distanceMeters: Float(measurement.distanceMeters)))
-                    .font(.caption)
-                    .fontWeight(.bold)
+                    .font(.system(size: 12 * overlayScale, weight: .bold))
                     .foregroundStyle(isSelected ? .black : .white)
 
-                HStack(spacing: 4) {
+                HStack(spacing: 4 * overlayScale) {
                     Image(systemName: measurement.isFromAR ? "checkmark.seal.fill" : "wave.3.right")
-                        .font(.system(size: 8))
+                        .font(.system(size: 8 * overlayScale))
                     Text(measurement.isFromAR ? "AR precisa" : "~ estimada")
-                        .font(.system(size: 9))
+                        .font(.system(size: 9 * overlayScale))
                 }
                 .foregroundStyle(isSelected ? .black.opacity(0.7) : .white.opacity(0.85))
             }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 5)
+            .padding(.horizontal, 10 * overlayScale)
+            .padding(.vertical, 5 * overlayScale)
             .background(isSelected ? Color.yellow.opacity(0.9) : labelBg, in: RoundedRectangle(cornerRadius: 8))
-            .position(x: (pA.x + pB.x) / 2, y: (pA.y + pB.y) / 2 - 22)
+            .position(x: (pA.x + pB.x) / 2, y: (pA.y + pB.y) / 2 - 22 * overlayScale)
+
+            // Línea punteada desde midpoint al handle de rotación
+            if isSelected {
+                let mid = CGPoint(x: (pA.x + pB.x) / 2, y: (pA.y + pB.y) / 2)
+                let rPos = rotationHandlePosition(pA: pA, pB: pB)
+                Path { path in
+                    path.move(to: mid)
+                    path.addLine(to: rPos)
+                }
+                .stroke(Color.orange.opacity(0.5), style: StrokeStyle(lineWidth: 1.5 * overlayScale, dash: [4 * overlayScale, 3 * overlayScale]))
+            }
 
             if isEditMode && !isSelected {
                 Button(action: onDelete) {
                     Image(systemName: "xmark.circle.fill")
-                        .font(.title3)
+                        .font(.system(size: 20 * overlayScale))
                         .foregroundStyle(.red)
                         .background(Circle().fill(.white))
                 }
-                .position(x: (pA.x + pB.x) / 2 + 50, y: (pA.y + pB.y) / 2 - 22)
+                .position(x: (pA.x + pB.x) / 2 + 50 * overlayScale, y: (pA.y + pB.y) / 2 - 22 * overlayScale)
             }
+        }
+    }
+
+    private func rotationHandlePosition(pA: CGPoint, pB: CGPoint) -> CGPoint {
+        let mid = CGPoint(x: (pA.x + pB.x) / 2, y: (pA.y + pB.y) / 2)
+        let dx = pB.x - pA.x
+        let dy = pB.y - pA.y
+        let len = hypot(dx, dy)
+        guard len > 1 else { return CGPoint(x: mid.x, y: mid.y - 30) }
+        let perpX = -dy / len * 30  // 30pt perpendicular
+        let perpY = dx / len * 30
+        return CGPoint(x: mid.x + perpX, y: mid.y + perpY)
+    }
+}
+
+/// Handle de rotación para mediciones.
+struct RotationHandleView: View {
+    var overlayScale: CGFloat = 1.0
+
+    var body: some View {
+        ZStack {
+            Circle()
+                .fill(Color.orange.opacity(0.3))
+                .frame(width: 28 * overlayScale, height: 28 * overlayScale)
+            Circle()
+                .fill(Color.orange)
+                .frame(width: 18 * overlayScale, height: 18 * overlayScale)
+            Image(systemName: "arrow.triangle.2.circlepath")
+                .font(.system(size: 10 * overlayScale, weight: .bold))
+                .foregroundStyle(.white)
         }
     }
 }
@@ -506,18 +587,19 @@ struct EnhancedMeasurementOverlay: View {
 /// Endpoint de medición mejorado.
 struct MeasurementEndpoint: View {
     let color: Color
-    
+    var overlayScale: CGFloat = 1.0
+
     var body: some View {
         ZStack {
             Circle()
                 .fill(color.opacity(0.3))
-                .frame(width: 18, height: 18)
+                .frame(width: 18 * overlayScale, height: 18 * overlayScale)
             Circle()
                 .fill(color)
-                .frame(width: 10, height: 10)
+                .frame(width: 10 * overlayScale, height: 10 * overlayScale)
             Circle()
-                .stroke(Color.white, lineWidth: 1.5)
-                .frame(width: 10, height: 10)
+                .stroke(Color.white, lineWidth: 1.5 * overlayScale)
+                .frame(width: 10 * overlayScale, height: 10 * overlayScale)
         }
     }
 }
@@ -586,17 +668,19 @@ private struct InfoChip: View {
 
 /// Handle visual de drag: circulo amarillo con icono de flechas.
 struct DragHandleView: View {
+    var overlayScale: CGFloat = 1.0
+
     var body: some View {
         ZStack {
             Circle()
                 .fill(Color.yellow)
                 .frame(
-                    width: AppConstants.OffsiteEditor.dragHandleSize,
-                    height: AppConstants.OffsiteEditor.dragHandleSize
+                    width: AppConstants.OffsiteEditor.dragHandleSize * overlayScale,
+                    height: AppConstants.OffsiteEditor.dragHandleSize * overlayScale
                 )
                 .shadow(color: .black.opacity(0.4), radius: 3, y: 1)
             Image(systemName: "arrow.up.and.down.and.arrow.left.and.right")
-                .font(.system(size: 12, weight: .bold))
+                .font(.system(size: 12 * overlayScale, weight: .bold))
                 .foregroundStyle(.black)
         }
     }
@@ -606,14 +690,16 @@ struct DragHandleView: View {
 
 /// Handle visual de resize: circulo blanco con icono de diagonal.
 struct ResizeHandleView: View {
+    var overlayScale: CGFloat = 1.0
+
     var body: some View {
         ZStack {
             Circle()
                 .fill(Color.white)
-                .frame(width: 22, height: 22)
+                .frame(width: 22 * overlayScale, height: 22 * overlayScale)
                 .shadow(color: .black.opacity(0.4), radius: 3, y: 1)
             Image(systemName: "arrow.up.left.and.arrow.down.right")
-                .font(.system(size: 10, weight: .bold))
+                .font(.system(size: 10 * overlayScale, weight: .bold))
                 .foregroundStyle(.blue)
         }
     }
