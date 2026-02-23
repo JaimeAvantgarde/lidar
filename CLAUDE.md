@@ -60,8 +60,8 @@ lidar/
 ### Captura (on-site)
 `ContentView` → botón cámara → `ARSceneManager.captureForOffsite()`:
 
-1. Captura screenshot del ARSCNView a resolución retina
-2. Proyecta todas las mediciones 3D a coordenadas 2D normalizadas (`projectPoint()`)
+1. Captura imagen pura de cámara via `ARFrame.capturedImage` (CVPixelBuffer, sin overlays SceneKit)
+2. Proyecta todas las mediciones 3D a coordenadas 2D normalizadas (`ARCamera.projectPoint()` con viewport = imagen capturada)
 3. Proyecta los 4 corners de cada cuadro para perspectiva real
 4. Exporta todos los planos con vértices proyectados, clasificación, transforms
 5. Detecta y exporta esquinas (intersecciones de planos)

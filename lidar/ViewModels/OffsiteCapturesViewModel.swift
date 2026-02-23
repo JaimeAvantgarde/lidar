@@ -455,8 +455,7 @@ final class OffsiteCaptureDetailViewModel {
             let newBy = clamp(m.pointB.y + dy, 0, 1)
             m.pointA = NormalizedPoint(x: newAx, y: newAy)
             m.pointB = NormalizedPoint(x: newBx, y: newBy)
-            // Recalcular distancia al mover (depth-aware si disponible)
-            m.distanceMeters = recalculateDistance(pointA: m.pointA, pointB: m.pointB, data: currentData, imageSize: imageSize, viewSize: viewSize)
+            // No recalcular: mover la medición entera preserva la distancia original
             currentData.measurements[idx] = m
 
         case .measurementRotate(let id):
@@ -475,7 +474,7 @@ final class OffsiteCaptureDetailViewModel {
             let newHalfDy = halfDx * sinA + halfDy * cosA
             m.pointA = NormalizedPoint(x: clamp(midX - newHalfDx, 0, 1), y: clamp(midY - newHalfDy, 0, 1))
             m.pointB = NormalizedPoint(x: clamp(midX + newHalfDx, 0, 1), y: clamp(midY + newHalfDy, 0, 1))
-            m.distanceMeters = recalculateDistance(pointA: m.pointA, pointB: m.pointB, data: currentData, imageSize: imageSize, viewSize: viewSize)
+            // No recalcular: rotar preserva la longitud de la medición
             currentData.measurements[idx] = m
 
         case .frame(let id):
@@ -1313,34 +1312,34 @@ final class OffsiteCaptureDetailViewModel {
         guard let depthA = sampleDepth(at: pointA, depthData: depthData, width: dmW, height: dmH),
               let depthB = sampleDepth(at: pointB, depthData: depthData, width: dmW, height: dmH) else { return nil }
 
-        // Intrínsecos nativos de la cámara ARKit
+        // Intrínsecos nativos de la cámara ARKit (orientación landscape-left)
         let intrinsics = cam.intrinsicsMatrix
-        let nativeFx = intrinsics.columns.0.x
-        let nativeFy = intrinsics.columns.1.y
-        let nativeCx = intrinsics.columns.2.x
-        let nativeCy = intrinsics.columns.2.y
+        let nativeFx = intrinsics.columns.0.x  // focal x en landscape
+        let nativeFy = intrinsics.columns.1.y  // focal y en landscape
+        let nativeCx = intrinsics.columns.2.x  // centro óptico x en landscape
+        let nativeCy = intrinsics.columns.2.y  // centro óptico y en landscape
 
-        // La resolución nativa de la cámara ARKit es el depth map en landscape, rotado a portrait.
-        // El depth map es landscape (ej. 256x192), la cámara nativa es ~1920x1440 landscape.
-        // imageWidth/Height es la resolución de la vista capturada en puntos*scale.
-        // Las coordenadas normalizadas son relativas a imageWidth x imageHeight.
-        // Escalar intrínsecos: factor = imageSize / nativeCameraSize
-        // Pero no tenemos la resolución nativa. Podemos derivarla:
-        // nativeWidth ≈ 2 * nativeCx, nativeHeight ≈ 2 * nativeCy (el centro óptico está ~centrado)
-        let imgW = Float(cam.imageWidth)
-        let imgH = Float(cam.imageHeight)
-        let estimatedNativeW = 2 * nativeCx
-        let estimatedNativeH = 2 * nativeCy
-        guard estimatedNativeW > 0, estimatedNativeH > 0 else { return nil }
+        // imageWidth/Height está en portrait (imagen rotada .right desde landscape-left).
+        // Rotación .right (90° CW): portrait_x = landscape_y, portrait_y = landscape_width - landscape_x
+        // Intrínsecos en portrait: fx_p = fy_native, fy_p = fx_native, cx_p = cy_native, cy_p = cx_native
+        let imgW = Float(cam.imageWidth)   // portrait width
+        let imgH = Float(cam.imageHeight)  // portrait height
 
-        let scaleX = imgW / estimatedNativeW
-        let scaleY = imgH / estimatedNativeH
-        let fx = nativeFx * scaleX
-        let fy = nativeFy * scaleY
-        let cx = nativeCx * scaleX
-        let cy = nativeCy * scaleY
+        // Resolución nativa landscape estimada desde centro óptico
+        let estimatedNativeLandscapeW = 2 * nativeCx  // ancho landscape
+        let estimatedNativeLandscapeH = 2 * nativeCy  // alto landscape
+        guard estimatedNativeLandscapeW > 0, estimatedNativeLandscapeH > 0 else { return nil }
 
-        // Convertir coordenadas normalizadas a pixeles de la imagen capturada
+        // Portrait: width corresponde a landscape height, height a landscape width
+        let scaleX = imgW / estimatedNativeLandscapeH   // portrait width / landscape height
+        let scaleY = imgH / estimatedNativeLandscapeW   // portrait height / landscape width
+
+        let fx = nativeFy * scaleX   // portrait fx = landscape fy, escalado a portrait width
+        let fy = nativeFx * scaleY   // portrait fy = landscape fx, escalado a portrait height
+        let cx = nativeCy * scaleX   // portrait cx = landscape cy, escalado
+        let cy = nativeCx * scaleY   // portrait cy = landscape cx, escalado
+
+        // Convertir coordenadas normalizadas a pixeles de la imagen portrait
         let pixA = SIMD2<Float>(Float(pointA.x) * imgW, Float(pointA.y) * imgH)
         let pixB = SIMD2<Float>(Float(pointB.x) * imgW, Float(pointB.y) * imgH)
 
